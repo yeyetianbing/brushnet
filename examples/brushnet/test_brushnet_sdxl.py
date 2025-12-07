@@ -9,15 +9,15 @@ base_model_path = "data/ckpt/juggernautXL_juggernautX"
 # base_model_path = "stabilityai/stable-diffusion-xl-base-1.0"
 
 # input brushnet ckpt path
-brushnet_path = "data/ckpt/segmentation_mask_brushnet_ckpt_sdxl_v0"
+brushnet_path = "data/ckpt/segmentation_mask_brushnet_ckpt_sdxl_v1"
 
 # choose whether using blended operation
-blended = False
+blended = True
 
 # input source image / mask image path and the text prompt
 image_path="examples/brushnet/src/test_image.jpg"
 mask_path="examples/brushnet/src/test_mask.jpg"
-caption="A cake on the table."
+caption="A strawberry cake on the table."
 
 # conditioning scale
 brushnet_conditioning_scale=1.0

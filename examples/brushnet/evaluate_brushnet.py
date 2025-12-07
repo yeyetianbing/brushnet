@@ -150,7 +150,7 @@ parser.add_argument('--brushnet_ckpt_path',
                     default="data/ckpt/segmentation_mask_brushnet_ckpt")
 parser.add_argument('--base_model_path', 
                     type=str, 
-                    default="runwayml/stable-diffusion-v1-5")
+                    default="stable-diffusion-v1-5/stable-diffusion-v1-5")
 parser.add_argument('--image_save_path', 
                     type=str, 
                     default="runs/evaluation_result/BrushBench/brushnet_segmask/inside")

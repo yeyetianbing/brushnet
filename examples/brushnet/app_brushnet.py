@@ -29,7 +29,7 @@ image_examples = [
 
 # choose the base model here
 base_model_path = "data/ckpt/realisticVisionV60B1_v51VAE"
-# base_model_path = "runwayml/stable-diffusion-v1-5"
+# base_model_path = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 
 # input brushnet ckpt path
 brushnet_path = "data/ckpt/segmentation_mask_brushnet_ckpt"

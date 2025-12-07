@@ -6,7 +6,7 @@ from PIL import Image
 
 # choose the base model here
 base_model_path = "data/ckpt/realisticVisionV60B1_v51VAE"
-# base_model_path = "runwayml/stable-diffusion-v1-5"
+# base_model_path = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 
 # input brushnet ckpt path
 brushnet_path = "data/ckpt/segmentation_mask_brushnet_ckpt"
@@ -17,11 +17,12 @@ blended = False
 # input source image / mask image path and the text prompt
 image_path="examples/brushnet/src/test_image.jpg"
 mask_path="examples/brushnet/src/test_mask.jpg"
-caption="A cake on the table."
+caption="A strawberry cake on the table."
 
 # conditioning scale
 brushnet_conditioning_scale=1.0
 
+#加载 BrushNet 和带 BrushNet 的 Stable Diffusion 管线
 brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(
     base_model_path, brushnet=brushnet, torch_dtype=torch.float16, low_cpu_mem_usage=False
@@ -66,4 +67,4 @@ if blended:
     image_pasted=image_pasted.astype(image_np.dtype)
     image=Image.fromarray(image_pasted)
 
-image.save("output.png")
+image.save("output1.png")
