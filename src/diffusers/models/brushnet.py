@@ -448,6 +448,37 @@ class BrushNetModel(ModelMixin, ConfigMixin):
                 brushnet_block = zero_module(brushnet_block)
                 self.brushnet_up_blocks.append(brushnet_block)
 
+        # 自适应特征融合模块
+        # 为每个下采样块、中间块和上采样块创建独立的融合模块
+        self.adaptive_fusion_down = nn.ModuleList([])
+        self.adaptive_fusion_up = nn.ModuleList([])
+
+        # 为下采样块创建融合模块
+        # 注意：down_block_res_samples 包含 conv_in 的输出 + 所有下采样块的输出
+        # 第一个输出是 conv_in，通道数为 block_out_channels[0]
+        self.adaptive_fusion_down.append(AdaptiveFeatureFusion(block_out_channels[0]))
+
+        for i, down_block in enumerate(self.down_blocks):
+            # 获取该块的输出通道数
+            out_channels = block_out_channels[i]
+            # 每个下采样块有 layers_per_block 个 ResNet 输出 + 可能的下采样输出
+            num_outputs = layers_per_block + (1 if i < len(block_out_channels) - 1 else 0)
+            for _ in range(num_outputs):
+                self.adaptive_fusion_down.append(AdaptiveFeatureFusion(out_channels))
+
+        # 为中间块创建融合模块
+        mid_channels = block_out_channels[-1]
+        self.adaptive_fusion_mid = AdaptiveFeatureFusion(mid_channels)
+
+        # 为上采样块创建融合模块
+        for i, up_block in enumerate(self.up_blocks):
+            # 获取该块的输出通道数
+            out_channels = reversed_block_out_channels[i]
+            # 每个上采样块有 layers_per_block+1 个输出 + 可能的上采样输出
+            num_outputs = layers_per_block + 1 + (1 if i < len(block_out_channels) - 1 else 0)
+            for _ in range(num_outputs):
+                self.adaptive_fusion_up.append(AdaptiveFeatureFusion(out_channels))
+
 
     @classmethod
     def from_unet(
@@ -827,10 +858,12 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
             down_block_res_samples += res_samples
 
-        # 4. PaintingNet down blocks
+        # 4. BrushNet down blocks with adaptive feature fusion
         brushnet_down_block_res_samples = ()
-        for down_block_res_sample, brushnet_down_block in zip(down_block_res_samples, self.brushnet_down_blocks):
+        for i, (down_block_res_sample, brushnet_down_block) in enumerate(zip(down_block_res_samples, self.brushnet_down_blocks)):
             down_block_res_sample = brushnet_down_block(down_block_res_sample)
+            # 应用自适应特征融合
+            down_block_res_sample = self.adaptive_fusion_down[i](down_block_res_sample)
             brushnet_down_block_res_samples = brushnet_down_block_res_samples + (down_block_res_sample,)
 
 
@@ -847,8 +880,10 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             else:
                 sample = self.mid_block(sample, emb)
 
-        # 6. BrushNet mid blocks
+        # 6. BrushNet mid blocks with adaptive feature fusion
         brushnet_mid_block_res_sample = self.brushnet_mid_block(sample)
+        # 应用自适应特征融合
+        brushnet_mid_block_res_sample = self.adaptive_fusion_mid(brushnet_mid_block_res_sample)
 
 
         # 7. up
@@ -886,10 +921,12 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
             up_block_res_samples += up_res_samples
 
-        # 8. BrushNet up blocks
+        # 8. BrushNet up blocks with adaptive feature fusion
         brushnet_up_block_res_samples = ()
-        for up_block_res_sample, brushnet_up_block in zip(up_block_res_samples, self.brushnet_up_blocks):
+        for i, (up_block_res_sample, brushnet_up_block) in enumerate(zip(up_block_res_samples, self.brushnet_up_blocks)):
             up_block_res_sample = brushnet_up_block(up_block_res_sample)
+            # 应用自适应特征融合
+            up_block_res_sample = self.adaptive_fusion_up[i](up_block_res_sample)
             brushnet_up_block_res_samples = brushnet_up_block_res_samples + (up_block_res_sample,)
 
         # 6. scaling
@@ -923,6 +960,68 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             mid_block_res_sample=brushnet_mid_block_res_sample,
             up_block_res_samples=brushnet_up_block_res_samples
         )
+
+
+class AdaptiveFeatureFusion(nn.Module):
+    """
+    自适应特征融合模块 (Adaptive Feature Fusion Module)
+
+    该模块通过通道注意力和空间注意力机制，动态学习特征的重要性，
+    相比简单的标量缩放，能够更精细地控制条件信息的融合。
+
+    原理：
+    1. 通道注意力：学习哪些特征通道更重要（如纹理、边缘、颜色等）
+    2. 空间注意力：学习哪些空间位置更重要（如掩码区域 vs 背景区域）
+
+    Args:
+        channels (int): 输入特征的通道数
+        reduction_ratio (int): 通道注意力的降维比例，默认为16
+    """
+    def __init__(self, channels, reduction_ratio=16):
+        super().__init__()
+
+        # 通道注意力模块
+        # 通过全局平均池化 + MLP 学习通道权重
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # [B, C, H, W] -> [B, C, 1, 1]
+            nn.Conv2d(channels, channels // reduction_ratio, 1, bias=False),  # 降维减少参数
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction_ratio, channels, 1, bias=False),  # 升维恢复通道数
+            nn.Sigmoid()  # 输出0-1之间的权重
+        )
+
+        # 空间注意力模块
+        # 通过通道统计 + 卷积学习空间权重
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),  # 大卷积核捕获空间上下文
+            nn.Sigmoid()  # 输出0-1之间的权重
+        )
+
+    def forward(self, x):
+        """
+        前向传播
+
+        Args:
+            x (torch.Tensor): 输入特征 [B, C, H, W]
+
+        Returns:
+            torch.Tensor: 自适应融合后的特征 [B, C, H, W]
+        """
+        # 1. 通道注意力
+        # 为每个通道学习一个权重，重要的通道（如掩码区域的纹理）获得更高权重
+        channel_weight = self.channel_attention(x)  # [B, C, 1, 1]
+        x_channel = x * channel_weight  # 广播乘法，每个通道按权重缩放
+
+        # 2. 空间注意力
+        # 计算每个空间位置的重要性统计量
+        avg_out = torch.mean(x_channel, dim=1, keepdim=True)  # [B, 1, H, W] 平均激活
+        max_out, _ = torch.max(x_channel, dim=1, keepdim=True)  # [B, 1, H, W] 最大激活
+        spatial_input = torch.cat([avg_out, max_out], dim=1)  # [B, 2, H, W] 拼接统计量
+
+        spatial_weight = self.spatial_attention(spatial_input)  # [B, 1, H, W]
+        x_spatial = x_channel * spatial_weight  # 每个位置按权重缩放
+
+        return x_spatial
 
 
 def zero_module(module):
