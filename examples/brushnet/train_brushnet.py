@@ -570,6 +570,25 @@ def parse_args(input_args=None):
             "Training BrushNet with random mask"
         ),
     )
+    parser.add_argument(
+        "--fusion_activation",
+        type=str,
+        default="relu",
+        choices=["relu", "silu", "gelu"],
+        help="Activation function for adaptive feature fusion module. Choose from 'relu', 'silu', 'gelu'. Default: 'relu'.",
+    )
+    parser.add_argument(
+        "--fusion_use_residual",
+        action="store_true",
+        default=True,
+        help="Whether to use residual connection in adaptive feature fusion module. Default: True.",
+    )
+    parser.add_argument(
+        "--fusion_strength",
+        type=float,
+        default=0.5,
+        help="Initial fusion strength for adaptive feature fusion module (0.0-1.0). Lower values preserve more original features. Default: 0.3 (conservative).",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1001,7 +1020,13 @@ def main(args):
         brushnet = BrushNetModel.from_pretrained(args.brushnet_model_name_or_path)
     else:
         logger.info("Initializing brushnet weights from unet")
-        brushnet = BrushNetModel.from_unet(unet)
+        logger.info(f"Fusion config: activation={args.fusion_activation}, use_residual={args.fusion_use_residual}, strength={args.fusion_strength}")
+        brushnet = BrushNetModel.from_unet(
+            unet,
+            fusion_activation=args.fusion_activation,
+            fusion_use_residual=args.fusion_use_residual,
+            fusion_strength=args.fusion_strength,
+        )
 
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):

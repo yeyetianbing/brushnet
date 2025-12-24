@@ -149,9 +149,9 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         ),
         mid_block_type: Optional[str] = "UNetMidBlock2D",
         up_block_types: Tuple[str, ...] = (
-            "UpBlock2D", 
-            "UpBlock2D", 
-            "UpBlock2D", 
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
             "UpBlock2D",
         ),
         only_cross_attention: Union[bool, Tuple[bool]] = False,
@@ -180,6 +180,10 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         conditioning_embedding_out_channels: Optional[Tuple[int, ...]] = (16, 32, 96, 256),
         global_pool_conditions: bool = False,
         addition_embed_type_num_heads: int = 64,
+        # 自适应特征融合模块参数
+        fusion_activation: str = "relu",
+        fusion_use_residual: bool = True,
+        fusion_strength: float = 0.3,
     ):
         super().__init__()
 
@@ -456,7 +460,14 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         # 为下采样块创建融合模块
         # 注意：down_block_res_samples 包含 conv_in 的输出 + 所有下采样块的输出
         # 第一个输出是 conv_in，通道数为 block_out_channels[0]
-        self.adaptive_fusion_down.append(AdaptiveFeatureFusion(block_out_channels[0]))
+        self.adaptive_fusion_down.append(
+            AdaptiveFeatureFusion(
+                block_out_channels[0],
+                activation=fusion_activation,
+                use_residual=fusion_use_residual,
+                fusion_strength=fusion_strength
+            )
+        )
 
         for i, down_block in enumerate(self.down_blocks):
             # 获取该块的输出通道数
@@ -464,11 +475,23 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             # 每个下采样块有 layers_per_block 个 ResNet 输出 + 可能的下采样输出
             num_outputs = layers_per_block + (1 if i < len(block_out_channels) - 1 else 0)
             for _ in range(num_outputs):
-                self.adaptive_fusion_down.append(AdaptiveFeatureFusion(out_channels))
+                self.adaptive_fusion_down.append(
+                    AdaptiveFeatureFusion(
+                        out_channels,
+                        activation=fusion_activation,
+                        use_residual=fusion_use_residual,
+                        fusion_strength=fusion_strength
+                    )
+                )
 
         # 为中间块创建融合模块
         mid_channels = block_out_channels[-1]
-        self.adaptive_fusion_mid = AdaptiveFeatureFusion(mid_channels)
+        self.adaptive_fusion_mid = AdaptiveFeatureFusion(
+            mid_channels,
+            activation=fusion_activation,
+            use_residual=fusion_use_residual,
+            fusion_strength=fusion_strength
+        )
 
         # 为上采样块创建融合模块
         for i, up_block in enumerate(self.up_blocks):
@@ -477,7 +500,14 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             # 每个上采样块有 layers_per_block+1 个输出 + 可能的上采样输出
             num_outputs = layers_per_block + 1 + (1 if i < len(block_out_channels) - 1 else 0)
             for _ in range(num_outputs):
-                self.adaptive_fusion_up.append(AdaptiveFeatureFusion(out_channels))
+                self.adaptive_fusion_up.append(
+                    AdaptiveFeatureFusion(
+                        out_channels,
+                        activation=fusion_activation,
+                        use_residual=fusion_use_residual,
+                        fusion_strength=fusion_strength
+                    )
+                )
 
 
     @classmethod
@@ -488,6 +518,9 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         conditioning_embedding_out_channels: Optional[Tuple[int, ...]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = True,
         conditioning_channels: int = 5,
+        fusion_activation: str = "relu",
+        fusion_use_residual: bool = True,
+        fusion_strength: float = 0.3,
     ):
         r"""
         Instantiate a [`BrushNetModel`] from [`UNet2DConditionModel`].
@@ -539,6 +572,9 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
             brushnet_conditioning_channel_order=brushnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
+            fusion_activation=fusion_activation,
+            fusion_use_residual=fusion_use_residual,
+            fusion_strength=fusion_strength,
         )
 
         if load_weights_from_unet:
@@ -969,23 +1005,45 @@ class AdaptiveFeatureFusion(nn.Module):
     该模块通过通道注意力和空间注意力机制，动态学习特征的重要性，
     相比简单的标量缩放，能够更精细地控制条件信息的融合。
 
+    改进版本包含：
+    1. 可配置的激活函数（ReLU/SiLU/GELU等）
+    2. 残差连接保留原始特征
+    3. 可学习的融合强度参数
+
     原理：
     1. 通道注意力：学习哪些特征通道更重要（如纹理、边缘、颜色等）
     2. 空间注意力：学习哪些空间位置更重要（如掩码区域 vs 背景区域）
+    3. 残差连接：保留原始特征，避免信息丢失
+    4. 融合强度：控制注意力机制的影响程度
 
     Args:
         channels (int): 输入特征的通道数
         reduction_ratio (int): 通道注意力的降维比例，默认为16
+        activation (str): 激活函数类型，可选 'relu', 'silu', 'gelu'，默认为'relu'
+        use_residual (bool): 是否使用残差连接，默认为True
+        fusion_strength (float): 初始融合强度，默认为0.5（0表示完全保留原始特征，1表示完全使用注意力特征）
     """
-    def __init__(self, channels, reduction_ratio=16):
+    def __init__(self, channels, reduction_ratio=16, activation='relu', use_residual=True, fusion_strength=0.5):
         super().__init__()
+
+        self.use_residual = use_residual
+
+        # 选择激活函数
+        if activation == 'relu':
+            act_layer = nn.ReLU(inplace=True)
+        elif activation == 'silu':
+            act_layer = nn.SiLU(inplace=True)
+        elif activation == 'gelu':
+            act_layer = nn.GELU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}. Choose from 'relu', 'silu', 'gelu'")
 
         # 通道注意力模块
         # 通过全局平均池化 + MLP 学习通道权重
         self.channel_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),  # [B, C, H, W] -> [B, C, 1, 1]
             nn.Conv2d(channels, channels // reduction_ratio, 1, bias=False),  # 降维减少参数
-            nn.ReLU(inplace=True),
+            act_layer,
             nn.Conv2d(channels // reduction_ratio, channels, 1, bias=False),  # 升维恢复通道数
             nn.Sigmoid()  # 输出0-1之间的权重
         )
@@ -997,6 +1055,11 @@ class AdaptiveFeatureFusion(nn.Module):
             nn.Sigmoid()  # 输出0-1之间的权重
         )
 
+        # 可学习的融合强度参数
+        # 使用 nn.Parameter 使其可训练，初始化为 fusion_strength
+        # 通过 sigmoid 约束在 [0, 1] 范围内
+        self.fusion_alpha = nn.Parameter(torch.tensor(fusion_strength))
+
     def forward(self, x):
         """
         前向传播
@@ -1007,6 +1070,9 @@ class AdaptiveFeatureFusion(nn.Module):
         Returns:
             torch.Tensor: 自适应融合后的特征 [B, C, H, W]
         """
+        # 保存原始输入用于残差连接
+        identity = x
+
         # 1. 通道注意力
         # 为每个通道学习一个权重，重要的通道（如掩码区域的纹理）获得更高权重
         channel_weight = self.channel_attention(x)  # [B, C, 1, 1]
@@ -1019,9 +1085,23 @@ class AdaptiveFeatureFusion(nn.Module):
         spatial_input = torch.cat([avg_out, max_out], dim=1)  # [B, 2, H, W] 拼接统计量
 
         spatial_weight = self.spatial_attention(spatial_input)  # [B, 1, H, W]
-        x_spatial = x_channel * spatial_weight  # 每个位置按权重缩放
+        x_attention = x_channel * spatial_weight  # 每个位置按权重缩放
 
-        return x_spatial
+        # 3. 融合强度控制
+        # alpha 控制注意力特征的权重，(1-alpha) 控制原始特征的权重
+        alpha = torch.sigmoid(self.fusion_alpha)  # 约束在 [0, 1]
+
+        # 4. 残差连接
+        if self.use_residual:
+            # 加权融合：alpha * 注意力特征 + (1 - alpha) * 原始特征
+            # 当 alpha=0 时，完全保留原始特征（退化为恒等映射）
+            # 当 alpha=1 时，完全使用注意力特征
+            output = alpha * x_attention + (1 - alpha) * identity
+        else:
+            # 不使用残差连接，直接使用注意力特征
+            output = x_attention
+
+        return output
 
 
 def zero_module(module):
