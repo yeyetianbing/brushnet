@@ -57,6 +57,46 @@ check_min_version("0.27.0.dev0")
 logger = get_logger(__name__)
 
 
+def fft_low_frequency_loss(pred, target, low_freq_ratio=0.1):
+    """
+    Compute FFT-based low frequency consistency loss.
+
+    Args:
+        pred: predicted latents [B, C, H, W]
+        target: target latents [B, C, H, W]
+        low_freq_ratio: ratio of low frequency components to preserve (default: 0.1)
+
+    Returns:
+        Low frequency consistency loss
+    """
+    # Apply 2D FFT
+    pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
+    target_fft = torch.fft.fft2(target, dim=(-2, -1))
+
+    # Shift zero frequency to center
+    pred_fft_shifted = torch.fft.fftshift(pred_fft, dim=(-2, -1))
+    target_fft_shifted = torch.fft.fftshift(target_fft, dim=(-2, -1))
+
+    # Create low frequency mask
+    _, _, h, w = pred.shape
+    center_h, center_w = h // 2, w // 2
+    mask_h = int(h * low_freq_ratio)
+    mask_w = int(w * low_freq_ratio)
+
+    # Extract low frequency components
+    pred_low_freq = pred_fft_shifted[...,
+                                      center_h - mask_h//2:center_h + mask_h//2,
+                                      center_w - mask_w//2:center_w + mask_w//2]
+    target_low_freq = target_fft_shifted[...,
+                                          center_h - mask_h//2:center_h + mask_h//2,
+                                          center_w - mask_w//2:center_w + mask_w//2]
+
+    # Compute L2 loss on low frequency components (magnitude)
+    loss = F.mse_loss(torch.abs(pred_low_freq), torch.abs(target_low_freq), reduction="mean")
+
+    return loss
+
+
 def image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
 
@@ -588,6 +628,18 @@ def parse_args(input_args=None):
         type=float,
         default=0.5,
         help="Initial fusion strength for adaptive feature fusion module (0.0-1.0). Lower values preserve more original features. Default: 0.3 (conservative).",
+    )
+    parser.add_argument(
+        "--fft_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for FFT low frequency consistency loss. Default: 0.1.",
+    )
+    parser.add_argument(
+        "--fft_low_freq_ratio",
+        type=float,
+        default=0.1,
+        help="Ratio of low frequency components to preserve in FFT loss (0.0-1.0). Default: 0.1.",
     )
 
     if input_args is not None:
@@ -1323,7 +1375,19 @@ def main(args):
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                # Main MSE loss
+                mse_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                # FFT low frequency consistency loss
+                fft_loss = fft_low_frequency_loss(
+                    model_pred.float(),
+                    target.float(),
+                    low_freq_ratio=args.fft_low_freq_ratio
+                )
+
+                # Combined loss
+                loss = mse_loss + args.fft_loss_weight * fft_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1377,7 +1441,12 @@ def main(args):
                             global_step,
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                "mse_loss": mse_loss.detach().item(),
+                "fft_loss": fft_loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0]
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
