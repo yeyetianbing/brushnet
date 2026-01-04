@@ -184,6 +184,9 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         fusion_activation: str = "relu",
         fusion_use_residual: bool = True,
         fusion_strength: float = 0.3,
+        # 时间步自适应调制模块参数
+        use_timestep_modulation: bool = True,
+        timestep_modulation_activation: str = "silu",
     ):
         super().__init__()
 
@@ -509,6 +512,54 @@ class BrushNetModel(ModelMixin, ConfigMixin):
                     )
                 )
 
+        # 时间步自适应调制模块
+        # 为每个下采样块、中间块和上采样块创建独立的时间步调制模块
+        self.use_timestep_modulation = use_timestep_modulation
+        if use_timestep_modulation:
+            self.timestep_modulation_down = nn.ModuleList([])
+            self.timestep_modulation_up = nn.ModuleList([])
+
+            # 为下采样块创建时间步调制模块
+            self.timestep_modulation_down.append(
+                TimestepAdaptiveModulation(
+                    block_out_channels[0],
+                    time_embed_dim,
+                    activation=timestep_modulation_activation
+                )
+            )
+
+            for i, down_block in enumerate(self.down_blocks):
+                out_channels = block_out_channels[i]
+                num_outputs = layers_per_block + (1 if i < len(block_out_channels) - 1 else 0)
+                for _ in range(num_outputs):
+                    self.timestep_modulation_down.append(
+                        TimestepAdaptiveModulation(
+                            out_channels,
+                            time_embed_dim,
+                            activation=timestep_modulation_activation
+                        )
+                    )
+
+            # 为中间块创建时间步调制模块
+            self.timestep_modulation_mid = TimestepAdaptiveModulation(
+                mid_channels,
+                time_embed_dim,
+                activation=timestep_modulation_activation
+            )
+
+            # 为上采样块创建时间步调制模块
+            for i, up_block in enumerate(self.up_blocks):
+                out_channels = reversed_block_out_channels[i]
+                num_outputs = layers_per_block + 1 + (1 if i < len(block_out_channels) - 1 else 0)
+                for _ in range(num_outputs):
+                    self.timestep_modulation_up.append(
+                        TimestepAdaptiveModulation(
+                            out_channels,
+                            time_embed_dim,
+                            activation=timestep_modulation_activation
+                        )
+                    )
+
 
     @classmethod
     def from_unet(
@@ -521,6 +572,8 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         fusion_activation: str = "relu",
         fusion_use_residual: bool = True,
         fusion_strength: float = 0.3,
+        use_timestep_modulation: bool = True,
+        timestep_modulation_activation: str = "silu",
     ):
         r"""
         Instantiate a [`BrushNetModel`] from [`UNet2DConditionModel`].
@@ -575,6 +628,8 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             fusion_activation=fusion_activation,
             fusion_use_residual=fusion_use_residual,
             fusion_strength=fusion_strength,
+            use_timestep_modulation=use_timestep_modulation,
+            timestep_modulation_activation=timestep_modulation_activation,
         )
 
         if load_weights_from_unet:
@@ -894,12 +949,15 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
             down_block_res_samples += res_samples
 
-        # 4. BrushNet down blocks with adaptive feature fusion
+        # 4. BrushNet down blocks with adaptive feature fusion and timestep modulation
         brushnet_down_block_res_samples = ()
         for i, (down_block_res_sample, brushnet_down_block) in enumerate(zip(down_block_res_samples, self.brushnet_down_blocks)):
             down_block_res_sample = brushnet_down_block(down_block_res_sample)
             # 应用自适应特征融合
             down_block_res_sample = self.adaptive_fusion_down[i](down_block_res_sample)
+            # 应用时间步自适应调制
+            if self.use_timestep_modulation:
+                down_block_res_sample = self.timestep_modulation_down[i](down_block_res_sample, emb)
             brushnet_down_block_res_samples = brushnet_down_block_res_samples + (down_block_res_sample,)
 
 
@@ -916,10 +974,13 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             else:
                 sample = self.mid_block(sample, emb)
 
-        # 6. BrushNet mid blocks with adaptive feature fusion
+        # 6. BrushNet mid blocks with adaptive feature fusion and timestep modulation
         brushnet_mid_block_res_sample = self.brushnet_mid_block(sample)
         # 应用自适应特征融合
         brushnet_mid_block_res_sample = self.adaptive_fusion_mid(brushnet_mid_block_res_sample)
+        # 应用时间步自适应调制
+        if self.use_timestep_modulation:
+            brushnet_mid_block_res_sample = self.timestep_modulation_mid(brushnet_mid_block_res_sample, emb)
 
 
         # 7. up
@@ -957,12 +1018,15 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
             up_block_res_samples += up_res_samples
 
-        # 8. BrushNet up blocks with adaptive feature fusion
+        # 8. BrushNet up blocks with adaptive feature fusion and timestep modulation
         brushnet_up_block_res_samples = ()
         for i, (up_block_res_sample, brushnet_up_block) in enumerate(zip(up_block_res_samples, self.brushnet_up_blocks)):
             up_block_res_sample = brushnet_up_block(up_block_res_sample)
             # 应用自适应特征融合
             up_block_res_sample = self.adaptive_fusion_up[i](up_block_res_sample)
+            # 应用时间步自适应调制
+            if self.use_timestep_modulation:
+                up_block_res_sample = self.timestep_modulation_up[i](up_block_res_sample, emb)
             brushnet_up_block_res_samples = brushnet_up_block_res_samples + (up_block_res_sample,)
 
         # 6. scaling
@@ -996,6 +1060,90 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             mid_block_res_sample=brushnet_mid_block_res_sample,
             up_block_res_samples=brushnet_up_block_res_samples
         )
+
+
+class TimestepAdaptiveModulation(nn.Module):
+    """
+    时间步自适应调制模块 (Timestep-Adaptive Modulation)
+
+    该模块根据扩散过程的时间步动态调制特征，使模型能够在不同去噪阶段
+    采用不同的特征处理策略。
+
+    核心思想：
+    1. 早期时间步（高噪声）：需要更强的全局结构引导
+    2. 中期时间步（中等噪声）：平衡全局和局部特征
+    3. 后期时间步（低噪声）：关注细节和纹理
+
+    实现机制：
+    1. 时间步编码：将时间步映射到高维特征空间
+    2. 自适应缩放（scale）：根据时间步动态调整特征幅度
+    3. 自适应偏移（shift）：根据时间步动态调整特征偏置
+    4. 门控机制：学习时间步对特征的影响程度
+
+    Args:
+        channels (int): 输入特征的通道数
+        time_embed_dim (int): 时间步嵌入的维度
+        activation (str): 激活函数类型，默认为'silu'
+    """
+    def __init__(self, channels, time_embed_dim, activation='silu'):
+        super().__init__()
+
+        # 选择激活函数
+        if activation == 'relu':
+            self.act = nn.ReLU(inplace=True)
+        elif activation == 'silu':
+            self.act = nn.SiLU(inplace=True)
+        elif activation == 'gelu':
+            self.act = nn.GELU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        # 时间步到调制参数的映射
+        # 从时间步嵌入生成 scale 和 shift 参数
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, channels * 2),
+            self.act,
+        )
+
+        # 门控机制：学习时间步调制的影响强度
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, channels),
+            nn.Sigmoid()  # 输出 0-1 之间的门控值
+        )
+
+        # 初始化：使调制在训练初期接近恒等映射
+        nn.init.zeros_(self.time_mlp[-2].weight)
+        nn.init.zeros_(self.time_mlp[-2].bias)
+
+    def forward(self, x, time_emb):
+        """
+        前向传播
+
+        Args:
+            x (torch.Tensor): 输入特征 [B, C, H, W]
+            time_emb (torch.Tensor): 时间步嵌入 [B, time_embed_dim]
+
+        Returns:
+            torch.Tensor: 调制后的特征 [B, C, H, W]
+        """
+        # 生成调制参数
+        modulation = self.time_mlp(time_emb)  # [B, C*2]
+        scale, shift = modulation.chunk(2, dim=1)  # 各 [B, C]
+
+        # 生成门控值
+        gate = self.gate_mlp(time_emb)  # [B, C]
+
+        # 重塑为 [B, C, 1, 1] 以便广播
+        scale = scale.unsqueeze(-1).unsqueeze(-1)
+        shift = shift.unsqueeze(-1).unsqueeze(-1)
+        gate = gate.unsqueeze(-1).unsqueeze(-1)
+
+        # 应用调制：x_out = gate * (scale * x + shift) + (1 - gate) * x
+        # 当 gate=0 时退化为恒等映射，当 gate=1 时完全应用调制
+        x_modulated = scale * x + shift
+        output = gate * x_modulated + (1 - gate) * x
+
+        return output
 
 
 class AdaptiveFeatureFusion(nn.Module):
