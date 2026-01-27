@@ -16,6 +16,7 @@ from torchmetrics.multimodal import CLIPScore
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.regression import MeanSquaredError
+from torchmetrics.image.fid import FrechetInceptionDistance
 from urllib.request import urlretrieve 
 from PIL import Image
 import open_clip
@@ -42,6 +43,10 @@ class MetricsCalculator:
         self.clip_metric_calculator = CLIPScore(model_name_or_path="openai/clip-vit-large-patch14").to(device)
         # lpips
         self.lpips_metric_calculator = LearnedPerceptualImagePatchSimilarity(net_type='squeeze').to(device)
+        # ssim
+        self.ssim_metric_calculator = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        # fid
+        self.fid_metric_calculator = FrechetInceptionDistance(feature=2048).to(device)
         # aesthetic model
         self.aesthetic_model = torch.nn.Linear(768, 1)
         aesthetic_model_url = (
@@ -132,7 +137,7 @@ class MetricsCalculator:
             mask = np.array(mask).astype(np.float32)
             img_pred = img_pred * mask
             img_gt = img_gt * mask
-        
+
         difference = img_pred - img_gt
         difference_square = difference ** 2
         difference_square_sum = difference_square.sum()
@@ -141,7 +146,38 @@ class MetricsCalculator:
         mse = difference_square_sum/difference_size
 
         return mse.item()
-    
+
+    def calculate_ssim(self, img_pred, img_gt, mask=None):
+        img_pred = np.array(img_pred).astype(np.float32)/255.
+        img_gt = np.array(img_gt).astype(np.float32)/255.
+
+        assert img_pred.shape == img_gt.shape, "Image shapes should be the same."
+        if mask is not None:
+            mask = np.array(mask).astype(np.float32)
+            img_pred = img_pred * mask
+            img_gt = img_gt * mask
+
+        img_pred_tensor = torch.tensor(img_pred).permute(2,0,1).unsqueeze(0).to(self.device)
+        img_gt_tensor = torch.tensor(img_gt).permute(2,0,1).unsqueeze(0).to(self.device)
+
+        score = self.ssim_metric_calculator(img_pred_tensor, img_gt_tensor)
+        score = score.cpu().item()
+
+        return score
+
+    def update_fid(self, img, is_real=True):
+        img = np.array(img).astype(np.uint8)
+        img_tensor = torch.tensor(img).permute(2,0,1).unsqueeze(0).to(self.device)
+
+        self.fid_metric_calculator.update(img_tensor, real=is_real)
+
+    def compute_fid(self):
+        score = self.fid_metric_calculator.compute()
+        return score.cpu().item()
+
+    def reset_fid(self):
+        self.fid_metric_calculator.reset()
+
 
 
 parser = argparse.ArgumentParser()
@@ -240,10 +276,31 @@ for key, item in mapping_file.items():
     init_image.save(masked_image_save_path)
 
 # evaluation
-evaluation_df = pd.DataFrame(columns=['Image ID','Image Reward', 'HPS V2.1', 'Aesthetic Score', 'PSNR', 'LPIPS', 'MSE', 'CLIP Similarity'])
+evaluation_df = pd.DataFrame(columns=['Image ID','Image Reward', 'HPS V2.1', 'Aesthetic Score', 'PSNR', 'LPIPS', 'MSE', 'SSIM', 'CLIP Similarity'])
 
 metrics_calculator=MetricsCalculator(device)
 
+# First pass: collect images for FID calculation
+print("Collecting images for FID calculation...")
+metrics_calculator.reset_fid()
+for key, item in mapping_file.items():
+    image_path=item["image"]
+
+    src_image_path = os.path.join(args.base_dir, image_path)
+    src_image = Image.open(src_image_path).resize((512,512))
+
+    tgt_image_path=os.path.join(args.image_save_path, image_path)
+    tgt_image = Image.open(tgt_image_path).resize((512,512))
+
+    # Update FID with real and generated images
+    metrics_calculator.update_fid(src_image, is_real=True)
+    metrics_calculator.update_fid(tgt_image, is_real=False)
+
+# Compute FID score
+fid_score = metrics_calculator.compute_fid()
+print(f"FID Score: {fid_score}")
+
+# Second pass: evaluate other metrics
 for key, item in mapping_file.items():
     print(f"evaluating image {key} ...")
     image_path=item["image"]
@@ -257,7 +314,7 @@ for key, item in mapping_file.items():
     tgt_image = Image.open(tgt_image_path).resize((512,512))
 
     evaluation_result=[key]
-        
+
     mask = rle2mask(mask,(512,512))
     mask = 1 - mask[:,:,np.newaxis]
 
@@ -281,7 +338,10 @@ for key, item in mapping_file.items():
         
         if metric == 'MSE':
             metric_result = metrics_calculator.calculate_mse(src_image, tgt_image, mask)
-        
+
+        if metric == 'SSIM':
+            metric_result = metrics_calculator.calculate_ssim(tgt_image, src_image, mask)
+
         if metric == 'CLIP Similarity':
             metric_result = metrics_calculator.calculate_clip_similarity(tgt_image, prompt)
 
@@ -292,7 +352,13 @@ for key, item in mapping_file.items():
 print("The averaged evaluation result:")
 averaged_results=evaluation_df.mean(numeric_only=True)
 print(averaged_results)
-averaged_results.to_csv(os.path.join(args.image_save_path,"evaluation_result_sum.csv"))
+print(f"\nFID Score: {fid_score}")
+
+# Add FID to the summary
+averaged_results_with_fid = averaged_results.copy()
+averaged_results_with_fid['FID'] = fid_score
+
+averaged_results_with_fid.to_csv(os.path.join(args.image_save_path,"evaluation_result_sum.csv"))
 evaluation_df.to_csv(os.path.join(args.image_save_path,"evaluation_result.csv"))
 
 print(f"The generated images and evaluation results is saved in {args.image_save_path}")
