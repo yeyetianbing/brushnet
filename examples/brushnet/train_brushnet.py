@@ -625,8 +625,8 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--use_timestep_modulation",
         action="store_true",
-        default=True,
-        help="Whether to use timestep-adaptive modulation module. Default: True.",
+        default=False,
+        help="Whether to use timestep-adaptive modulation module. Default: False.",
     )
     parser.add_argument(
         "--timestep_modulation_activation",

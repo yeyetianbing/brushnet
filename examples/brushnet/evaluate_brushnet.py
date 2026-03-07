@@ -17,7 +17,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.regression import MeanSquaredError
 from torchmetrics.image.fid import FrechetInceptionDistance
-from urllib.request import urlretrieve 
+from urllib.request import urlretrieve
 from PIL import Image
 import open_clip
 import os
@@ -25,6 +25,10 @@ import hpsv2
 import ImageReward as RM
 import math
 from transformers import AutoProcessor, AutoModel
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from freeinpaint.metrics.guidance import ImageRewardScore, PromptRewardScore
+from freeinpaint.metrics.prefpaint import InpaintReward
 
 def rle2mask(mask_rle, shape): # height, width
     starts, lengths = [np.asarray(x, dtype=int) for x in (mask_rle[0:][::2], mask_rle[1:][::2])]
@@ -202,6 +206,15 @@ parser.add_argument('--mask_key',
                     default="inpainting_mask")
 parser.add_argument('--blended', action='store_true')
 parser.add_argument('--paintingnet_conditioning_scale', type=float,default=1.0)
+parser.add_argument('--reward_guidance_scale', type=float, default=0.0)
+parser.add_argument('--guide_per_steps', type=int, default=5)
+parser.add_argument('--overall_reward_scale', type=float, default=1.0)
+parser.add_argument('--prompt_reward_scale', type=float, default=1.0)
+parser.add_argument('--harmonic_reward_scale', type=float, default=1.0)
+parser.add_argument('--clip_model_path', type=str, default='openai/clip-vit-large-patch14')
+parser.add_argument('--imagereward_path', type=str, default='data/ckpt')
+parser.add_argument('--harmonic_config_path', type=str, default='examples/freeinpaint/metrics/config.yaml')
+parser.add_argument('--harmonic_ckpt_path', type=str, default='data/ckpt/harmonic_reward.pth')
 
 args = parser.parse_args()
 
@@ -210,7 +223,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 base_model_path = args.base_model_path
 brushnet_path = args.brushnet_ckpt_path
 
-brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16).to(device)
+brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16, use_timestep_modulation=False).to(device)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(
     base_model_path, brushnet=brushnet, torch_dtype=torch.float16,low_cpu_mem_usage=False
 )
@@ -221,6 +234,17 @@ pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 # pipe.enable_xformers_memory_efficient_attention()
 # memory optimization.
 pipe.enable_model_cpu_offload()
+
+# Initialize reward models if reward_guidance_scale > 0
+overall_reward = None
+prompt_reward = None
+harmonic_reward = None
+if args.reward_guidance_scale > 0:
+    overall_reward = ImageRewardScore(args.imagereward_path, device=device)
+    prompt_reward = PromptRewardScore(args.clip_model_path, device=device)
+    harmonic_reward = InpaintReward(args.harmonic_config_path, device=device)
+    if os.path.exists(args.harmonic_ckpt_path):
+        harmonic_reward.load_model(harmonic_reward, args.harmonic_ckpt_path)
 
 with open(args.mapping_file,"r") as f:
     mapping_file=json.load(f)
@@ -248,12 +272,20 @@ for key, item in mapping_file.items():
         continue
 
     image = pipe(
-        caption, 
-        init_image, 
-        mask_image, 
-        num_inference_steps=50, 
+        caption,
+        init_image,
+        mask_image,
+        num_inference_steps=50,
         generator=generator,
-        paintingnet_conditioning_scale=args.paintingnet_conditioning_scale
+        paintingnet_conditioning_scale=args.paintingnet_conditioning_scale,
+        overall_reward=overall_reward,
+        prompt_reward=prompt_reward,
+        harmonic_reward=harmonic_reward,
+        overall_reward_scale=args.overall_reward_scale,
+        prompt_reward_scale=args.prompt_reward_scale,
+        harmonic_reward_scale=args.harmonic_reward_scale,
+        reward_guidance_scale=args.reward_guidance_scale,
+        guide_per_steps=args.guide_per_steps,
     ).images[0]
     
     if not os.path.exists(os.path.dirname(save_path)):

@@ -12,6 +12,7 @@ from ...loaders import FromSingleFileMixin, IPAdapterMixin, LoraLoaderMixin, Tex
 from ...models import AutoencoderKL, BrushNetModel, ImageProjection, UNet2DConditionModel
 from ...models.lora import adjust_lora_scale_text_encoder
 from ...schedulers import KarrasDiffusionSchedulers
+from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, LMSDiscreteScheduler, PNDMScheduler
 from ...utils import (
     USE_PEFT_BACKEND,
     deprecate,
@@ -775,6 +776,79 @@ class StableDiffusionBrushNetPipeline(
         latents = noise * self.scheduler.init_noise_sigma
         return latents, noise
 
+    def cond_fn(
+        self,
+        latents,
+        cond_image,
+        mask,
+        text_embeddings,
+        timestep,
+        conditioning_latents,
+        cond_scale,
+        index,
+        overall_text_input,
+        prompt_text_input,
+        noise_pred_original,
+        reward_guidance_scale,
+        added_cond_kwargs,
+    ):
+        latents = latents.detach().requires_grad_()
+        latent_model_input = self.scheduler.scale_model_input(latents, timestep)
+
+        down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
+            latent_model_input,
+            timestep,
+            encoder_hidden_states=text_embeddings,
+            brushnet_cond=conditioning_latents,
+            conditioning_scale=cond_scale,
+            guess_mode=False,
+            return_dict=False,
+        )
+
+        noise_pred = self.unet(
+            latent_model_input,
+            timestep,
+            encoder_hidden_states=text_embeddings,
+            timestep_cond=None,
+            down_block_add_samples=down_block_res_samples,
+            mid_block_add_sample=mid_block_res_sample,
+            up_block_add_samples=up_block_res_samples,
+            added_cond_kwargs=added_cond_kwargs,
+            return_dict=False,
+        )[0]
+
+        if isinstance(self.scheduler, (PNDMScheduler, DDIMScheduler, DPMSolverMultistepScheduler)):
+            alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+            beta_prod_t = 1 - alpha_prod_t
+            pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+            fac = torch.sqrt(beta_prod_t)
+            sample = pred_original_sample * (fac) + latents * (1 - fac)
+        elif isinstance(self.scheduler, LMSDiscreteScheduler):
+            sigma = self.scheduler.sigmas[index]
+            sample = latents - sigma * noise_pred
+        else:
+            raise ValueError(f"scheduler type {type(self.scheduler)} not supported")
+
+        sample = 1 / self.vae.config.scaling_factor * sample
+        image = self.vae.decode(sample, return_dict=False)[0]
+        image = (image / 2 + 0.5).clamp(0, 1)
+
+        overall_score = self.overall_reward(overall_text_input, image) * self.overall_reward_scale
+        prompt_score = self.prompt_reward(prompt_text_input, image, mask) * self.prompt_reward_scale
+        harmonic_score, _ = self.harmonic_reward(image, mask)
+        harmonic_score = harmonic_score * self.harmonic_reward_scale
+
+        total_score = (overall_score + prompt_score + harmonic_score) * reward_guidance_scale
+        grads = torch.autograd.grad(total_score, latents)[0]
+
+        if isinstance(self.scheduler, LMSDiscreteScheduler):
+            latents = latents.detach() + grads * (sigma**2)
+            noise_pred = noise_pred_original
+        else:
+            noise_pred = noise_pred_original - torch.sqrt(alpha_prod_t) * grads
+
+        return noise_pred, latents
+
     # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
     def get_guidance_scale_embedding(self, w, embedding_dim=512, dtype=torch.float32):
         """
@@ -858,6 +932,14 @@ class StableDiffusionBrushNetPipeline(
         clip_skip: Optional[int] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        overall_reward: Optional[Any] = None,
+        prompt_reward: Optional[Any] = None,
+        harmonic_reward: Optional[Any] = None,
+        overall_reward_scale: float = 1.0,
+        prompt_reward_scale: float = 1.0,
+        harmonic_reward_scale: float = 1.0,
+        reward_guidance_scale: float = 0.0,
+        guide_per_steps: int = 5,
         **kwargs,
     ):
         r"""
@@ -977,6 +1059,16 @@ class StableDiffusionBrushNetPipeline(
 
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
+
+        # Save reward models and scales
+        self.overall_reward = overall_reward
+        self.prompt_reward = prompt_reward
+        self.harmonic_reward = harmonic_reward
+        self.overall_reward_scale = overall_reward_scale
+        self.prompt_reward_scale = prompt_reward_scale
+        self.harmonic_reward_scale = harmonic_reward_scale
+        self.reward_guidance_scale = reward_guidance_scale
+        self.guide_per_steps = guide_per_steps
 
         if callback is not None:
             deprecate(
@@ -1157,6 +1249,13 @@ class StableDiffusionBrushNetPipeline(
             ]
             brushnet_keep.append(keeps[0] if isinstance(brushnet, BrushNetModel) else keeps)
 
+        # 7.3 Prepare reward text inputs
+        overall_text_input = None
+        prompt_text_input = None
+        if self.reward_guidance_scale > 0 and self.overall_reward is not None and self.prompt_reward is not None:
+            overall_text_input = self.overall_reward.process_text(prompt if isinstance(prompt, str) else prompt[0])
+            prompt_text_input = self.prompt_reward.process_text(prompt if isinstance(prompt, str) else prompt[0])
+
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         is_unet_compiled = is_compiled_module(self.unet)
@@ -1226,6 +1325,29 @@ class StableDiffusionBrushNetPipeline(
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # Apply DeGu (cond_fn) guidance
+                if self.reward_guidance_scale > 0 and (i + 1) % self.guide_per_steps == 0:
+                    text_embeddings_guidance = prompt_embeds.chunk(2)[1] if self.do_classifier_free_guidance else prompt_embeds
+                    conditioning_latents_guidance = conditioning_latents.chunk(2)[1] if self.do_classifier_free_guidance else conditioning_latents
+                    mask_guidance = original_mask.chunk(2)[1] if self.do_classifier_free_guidance else original_mask
+                    mask_guidance = 1 - mask_guidance
+
+                    noise_pred, latents = self.cond_fn(
+                        latents,
+                        image,
+                        mask_guidance,
+                        text_embeddings_guidance,
+                        t,
+                        conditioning_latents_guidance,
+                        cond_scale,
+                        i,
+                        overall_text_input,
+                        prompt_text_input,
+                        noise_pred,
+                        self.reward_guidance_scale,
+                        added_cond_kwargs,
+                    )
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
