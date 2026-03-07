@@ -53,7 +53,8 @@ class MetricsCalculator:
                     "https://github.com/LAION-AI/aesthetic-predictor/blob/main/sa_0_4_vit_l_14_linear.pth?raw=true"
                 )
         aesthetic_model_ckpt_path=os.path.join(ckpt_path,"sa_0_4_vit_l_14_linear.pth")
-        urlretrieve(aesthetic_model_url, aesthetic_model_ckpt_path)
+        if not os.path.exists(aesthetic_model_ckpt_path):
+            urlretrieve(aesthetic_model_url, aesthetic_model_ckpt_path)
         self.aesthetic_model.load_state_dict(torch.load(aesthetic_model_ckpt_path))
         self.aesthetic_model.eval()
         self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
