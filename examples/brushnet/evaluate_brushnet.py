@@ -233,7 +233,10 @@ pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 # remove following line if xformers is not installed or when using Torch 2.0.
 # pipe.enable_xformers_memory_efficient_attention()
 # memory optimization.
-pipe.enable_model_cpu_offload()
+if args.reward_guidance_scale == 0:
+    pipe.enable_model_cpu_offload()
+else:
+    pipe.to(device)
 
 # Initialize reward models if reward_guidance_scale > 0
 overall_reward = None
@@ -244,7 +247,7 @@ if args.reward_guidance_scale > 0:
     prompt_reward = PromptRewardScore(args.clip_model_path, device=device)
     harmonic_reward = InpaintReward(args.harmonic_config_path, device=device)
     if os.path.exists(args.harmonic_ckpt_path):
-        harmonic_reward.load_model(harmonic_reward, args.harmonic_ckpt_path)
+        harmonic_reward = harmonic_reward.load_model(harmonic_reward, args.harmonic_ckpt_path)
 
 with open(args.mapping_file,"r") as f:
     mapping_file=json.load(f)

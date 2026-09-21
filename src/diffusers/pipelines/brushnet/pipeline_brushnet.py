@@ -12,7 +12,7 @@ from ...loaders import FromSingleFileMixin, IPAdapterMixin, LoraLoaderMixin, Tex
 from ...models import AutoencoderKL, BrushNetModel, ImageProjection, UNet2DConditionModel
 from ...models.lora import adjust_lora_scale_text_encoder
 from ...schedulers import KarrasDiffusionSchedulers
-from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, LMSDiscreteScheduler, PNDMScheduler
+from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, LMSDiscreteScheduler, PNDMScheduler, UniPCMultistepScheduler
 from ...utils import (
     USE_PEFT_BACKEND,
     deprecate,
@@ -792,54 +792,55 @@ class StableDiffusionBrushNetPipeline(
         reward_guidance_scale,
         added_cond_kwargs,
     ):
-        latents = latents.detach().requires_grad_()
-        latent_model_input = self.scheduler.scale_model_input(latents, timestep)
+        with torch.enable_grad():
+            latents = latents.detach().requires_grad_(True)
+            latent_model_input = self.scheduler.scale_model_input(latents, timestep)
 
-        down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
-            latent_model_input,
-            timestep,
-            encoder_hidden_states=text_embeddings,
-            brushnet_cond=conditioning_latents,
-            conditioning_scale=cond_scale,
-            guess_mode=False,
-            return_dict=False,
-        )
+            down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
+                latent_model_input,
+                timestep,
+                encoder_hidden_states=text_embeddings,
+                brushnet_cond=conditioning_latents,
+                conditioning_scale=cond_scale,
+                guess_mode=False,
+                return_dict=False,
+            )
 
-        noise_pred = self.unet(
-            latent_model_input,
-            timestep,
-            encoder_hidden_states=text_embeddings,
-            timestep_cond=None,
-            down_block_add_samples=down_block_res_samples,
-            mid_block_add_sample=mid_block_res_sample,
-            up_block_add_samples=up_block_res_samples,
-            added_cond_kwargs=added_cond_kwargs,
-            return_dict=False,
-        )[0]
+            noise_pred = self.unet(
+                latent_model_input,
+                timestep,
+                encoder_hidden_states=text_embeddings,
+                timestep_cond=None,
+                down_block_add_samples=down_block_res_samples,
+                mid_block_add_sample=mid_block_res_sample,
+                up_block_add_samples=up_block_res_samples,
+                added_cond_kwargs=added_cond_kwargs,
+                return_dict=False,
+            )[0]
 
-        if isinstance(self.scheduler, (PNDMScheduler, DDIMScheduler, DPMSolverMultistepScheduler)):
-            alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
-            beta_prod_t = 1 - alpha_prod_t
-            pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
-            fac = torch.sqrt(beta_prod_t)
-            sample = pred_original_sample * (fac) + latents * (1 - fac)
-        elif isinstance(self.scheduler, LMSDiscreteScheduler):
-            sigma = self.scheduler.sigmas[index]
-            sample = latents - sigma * noise_pred
-        else:
-            raise ValueError(f"scheduler type {type(self.scheduler)} not supported")
+            if isinstance(self.scheduler, (PNDMScheduler, DDIMScheduler, DPMSolverMultistepScheduler, UniPCMultistepScheduler)):
+                alpha_prod_t = self.scheduler.alphas_cumprod.to(latents.device)[timestep]
+                beta_prod_t = 1 - alpha_prod_t
+                pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+                fac = torch.sqrt(beta_prod_t)
+                sample = pred_original_sample * (fac) + latents * (1 - fac)
+            elif isinstance(self.scheduler, LMSDiscreteScheduler):
+                sigma = self.scheduler.sigmas[index]
+                sample = latents - sigma * noise_pred
+            else:
+                raise ValueError(f"scheduler type {type(self.scheduler)} not supported")
 
-        sample = 1 / self.vae.config.scaling_factor * sample
-        image = self.vae.decode(sample, return_dict=False)[0]
-        image = (image / 2 + 0.5).clamp(0, 1)
+            sample = 1 / self.vae.config.scaling_factor * sample
+            image = self.vae.decode(sample, return_dict=False)[0]
+            image = (image / 2 + 0.5).clamp(0, 1)
 
-        overall_score = self.overall_reward(overall_text_input, image) * self.overall_reward_scale
-        prompt_score = self.prompt_reward(prompt_text_input, image, mask) * self.prompt_reward_scale
-        harmonic_score, _ = self.harmonic_reward(image, mask)
-        harmonic_score = harmonic_score * self.harmonic_reward_scale
+            overall_score = self.overall_reward(overall_text_input, image) * self.overall_reward_scale
+            prompt_score = self.prompt_reward(prompt_text_input, image, mask) * self.prompt_reward_scale
+            harmonic_score, _ = self.harmonic_reward(image, mask)
+            harmonic_score = harmonic_score * self.harmonic_reward_scale
 
-        total_score = (overall_score + prompt_score + harmonic_score) * reward_guidance_scale
-        grads = torch.autograd.grad(total_score, latents)[0]
+            total_score = ((overall_score + prompt_score + harmonic_score) * reward_guidance_scale).to(latents.device)
+            grads = torch.autograd.grad(total_score, latents)[0]
 
         if isinstance(self.scheduler, LMSDiscreteScheduler):
             latents = latents.detach() + grads * (sigma**2)

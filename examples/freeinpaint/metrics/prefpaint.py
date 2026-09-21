@@ -75,9 +75,11 @@ class InpaintReward(nn.Module):
         self.dtype = dtype
         
         self.clip_model, self.preprocess = clip.load(self.config['clip_path'], device=self.device)
+        self.clip_model.float()
+        for param in self.clip_model.parameters():
+            param.data = param.data.float()
         self.mlp = MLP(self.config['Reward']['mlp_dim']).to(self.device)
         self.vit_block = ViTBlock(self.config["ViT"]["feature_dim"], self.config["ViT"]["num_heads"], self.config["ViT"]["mlp_dim"]).to(self.device)
-        # self.clip_model.to(dtype=self.dtype)
         self.mlp.to(dtype=self.dtype)
         self.vit_block.to(dtype=self.dtype)
 
@@ -139,12 +141,12 @@ class InpaintReward(nn.Module):
         return scores.item(), last_features.detach().cpu()
     
     def __call__(self, inpaint_image: torch.Tensor, mask_rgb: torch.Tensor):
-        img = self.preprocess_pt(inpaint_image).to(self.device, dtype=self.dtype)
+        img = self.preprocess_pt(inpaint_image).to(self.device, dtype=torch.float32)
         if mask_rgb.shape[1] == 1:
             mask_rgb = mask_rgb.repeat(1, 3, 1, 1)
-        mask = self.preprocess_pt(mask_rgb).to(self.device, dtype=self.dtype)
-        img_embed = self.clip_model.encode_image(img)
-        mask_embed = self.clip_model.encode_image(mask)
+        mask = self.preprocess_pt(mask_rgb).to(self.device, dtype=torch.float32)
+        img_embed = self.clip_model.encode_image(img).to(self.dtype)
+        mask_embed = self.clip_model.encode_image(mask).to(self.dtype)
         emb_feature = torch.cat((img_embed, mask_embed), dim=-1)
         emb_feature = emb_feature.unsqueeze(1)
         emb_feature = self.vit_block(emb_feature)
@@ -156,10 +158,12 @@ class InpaintReward(nn.Module):
         return scores, last_features
 
     def load_model(self, model, ckpt_path = None):
-        
+
         print('load checkpoint from %s'%ckpt_path)
         state_dict = {k: v for k, v in torch.load(ckpt_path, map_location='cpu').items()}
-        new_dict = {key.replace("module.", ""): value for key, value in state_dict.items()}
-        model.load_state_dict(new_dict)
-        
+        new_dict = {key.replace("module.", ""): value for key, value in state_dict.items() if not key.startswith("module.clip_model")}
+        model.load_state_dict(new_dict, strict=False)
+        model.to(self.device, dtype=self.dtype)
+        model.clip_model.to(self.device).float()
+
         return model 

@@ -1,0 +1,13 @@
+clip_path: ViT-B/32
+Reward: !munch.Munch
+  mlp_dim: 1024
+  model_path: data/ckpt/prefpaintReward.pt
+ViT: !munch.Munch
+  dropout: 0.1
+  feature_dim: 1024
+  mlp_dim: 1024
+  num_heads: 16
+
+fix_base: false
+fix_rate: 0.7
+group: False
