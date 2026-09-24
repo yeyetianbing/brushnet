@@ -126,6 +126,48 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _balance_reward_gradients(
+    reward_gradients: List[torch.Tensor],
+    reward_weights: List[float],
+    eps: float = 1e-6,
+    scale_min: float = 0.25,
+    scale_max: float = 4.0,
+) -> torch.Tensor:
+    """Balance heterogeneous reward gradients by their per-sample RMS magnitude."""
+    if len(reward_gradients) == 0:
+        raise ValueError("`reward_gradients` must contain at least one tensor.")
+    if len(reward_gradients) != len(reward_weights):
+        raise ValueError("`reward_gradients` and `reward_weights` must have the same length.")
+    if eps <= 0:
+        raise ValueError("`eps` must be greater than 0.")
+    if scale_min <= 0 or scale_max < scale_min:
+        raise ValueError("Reward-gradient scale bounds must satisfy 0 < scale_min <= scale_max.")
+    if any(weight < 0 for weight in reward_weights):
+        raise ValueError("Reward weights must be non-negative when gradient balancing is enabled.")
+
+    weight_sum = float(sum(reward_weights))
+    if weight_sum <= 0:
+        raise ValueError("At least one reward weight must be greater than 0 when gradient balancing is enabled.")
+
+    reference_shape = reward_gradients[0].shape
+    if any(gradient.shape != reference_shape for gradient in reward_gradients):
+        raise ValueError("All reward gradients must have the same shape.")
+
+    reduce_dims = tuple(range(1, reward_gradients[0].ndim))
+    gradient_rms = [
+        gradient.detach().float().square().mean(dim=reduce_dims, keepdim=True).sqrt().clamp_min(eps)
+        for gradient in reward_gradients
+    ]
+    reference_rms = torch.stack(gradient_rms, dim=0).mean(dim=0)
+
+    combined_gradient = torch.zeros_like(reward_gradients[0])
+    for gradient, weight, rms in zip(reward_gradients, reward_weights, gradient_rms):
+        balance_scale = (reference_rms / rms).clamp(min=scale_min, max=scale_max)
+        combined_gradient = combined_gradient + weight * gradient * balance_scale.to(gradient.dtype)
+
+    return combined_gradient
+
+
 class StableDiffusionBrushNetPipeline(
     DiffusionPipeline,
     StableDiffusionMixin,
@@ -834,13 +876,41 @@ class StableDiffusionBrushNetPipeline(
             image = self.vae.decode(sample, return_dict=False)[0]
             image = (image / 2 + 0.5).clamp(0, 1)
 
-            overall_score = self.overall_reward(overall_text_input, image) * self.overall_reward_scale
-            prompt_score = self.prompt_reward(prompt_text_input, image, mask) * self.prompt_reward_scale
+            overall_score = self.overall_reward(overall_text_input, image).to(latents.device)
+            prompt_score = self.prompt_reward(prompt_text_input, image, mask).to(latents.device)
             harmonic_score, _ = self.harmonic_reward(image, mask)
-            harmonic_score = harmonic_score * self.harmonic_reward_scale
+            harmonic_score = harmonic_score.to(latents.device)
 
-            total_score = ((overall_score + prompt_score + harmonic_score) * reward_guidance_scale).to(latents.device)
-            grads = torch.autograd.grad(total_score, latents)[0]
+            reward_scores = [overall_score, prompt_score, harmonic_score]
+            reward_weights = [
+                self.overall_reward_scale,
+                self.prompt_reward_scale,
+                self.harmonic_reward_scale,
+            ]
+
+            if self.balance_reward_gradients:
+                reward_gradients = []
+                for reward_index, reward_score in enumerate(reward_scores):
+                    reward_gradient = torch.autograd.grad(
+                        reward_score.sum(),
+                        latents,
+                        retain_graph=reward_index < len(reward_scores) - 1,
+                    )[0]
+                    reward_gradients.append(reward_gradient)
+
+                grads = _balance_reward_gradients(
+                    reward_gradients,
+                    reward_weights,
+                    eps=self.reward_gradient_eps,
+                    scale_min=self.reward_gradient_scale_min,
+                    scale_max=self.reward_gradient_scale_max,
+                )
+                grads = grads * reward_guidance_scale
+            else:
+                total_score = sum(
+                    weight * score for weight, score in zip(reward_weights, reward_scores)
+                )
+                grads = torch.autograd.grad((total_score * reward_guidance_scale).sum(), latents)[0]
 
         if isinstance(self.scheduler, LMSDiscreteScheduler):
             latents = latents.detach() + grads * (sigma**2)
@@ -941,6 +1011,10 @@ class StableDiffusionBrushNetPipeline(
         harmonic_reward_scale: float = 1.0,
         reward_guidance_scale: float = 0.0,
         guide_per_steps: int = 5,
+        balance_reward_gradients: bool = False,
+        reward_gradient_eps: float = 1e-6,
+        reward_gradient_scale_min: float = 0.25,
+        reward_gradient_scale_max: float = 4.0,
         **kwargs,
     ):
         r"""
@@ -1047,6 +1121,15 @@ class StableDiffusionBrushNetPipeline(
                 The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeine class.
+            balance_reward_gradients (`bool`, *optional*, defaults to `False`):
+                Whether to compute the three reward gradients separately and balance their per-sample RMS magnitudes
+                before applying the configured reward weights. Keep disabled to reproduce the original DeGu behavior.
+            reward_gradient_eps (`float`, *optional*, defaults to `1e-6`):
+                Numerical stability constant used by reward-gradient RMS balancing.
+            reward_gradient_scale_min (`float`, *optional*, defaults to `0.25`):
+                Minimum multiplicative rescaling applied to an individual reward gradient.
+            reward_gradient_scale_max (`float`, *optional*, defaults to `4.0`):
+                Maximum multiplicative rescaling applied to an individual reward gradient.
 
         Examples:
 
@@ -1061,7 +1144,34 @@ class StableDiffusionBrushNetPipeline(
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 
-        # Save reward models and scales
+        if reward_guidance_scale < 0:
+            raise ValueError("`reward_guidance_scale` must be non-negative.")
+        if guide_per_steps <= 0:
+            raise ValueError("`guide_per_steps` must be greater than 0.")
+        if reward_gradient_eps <= 0:
+            raise ValueError("`reward_gradient_eps` must be greater than 0.")
+        if reward_gradient_scale_min <= 0 or reward_gradient_scale_max < reward_gradient_scale_min:
+            raise ValueError(
+                "Reward-gradient scale bounds must satisfy "
+                "0 < reward_gradient_scale_min <= reward_gradient_scale_max."
+            )
+        if reward_guidance_scale > 0:
+            reward_models = [overall_reward, prompt_reward, harmonic_reward]
+            if any(reward_model is None for reward_model in reward_models):
+                raise ValueError(
+                    "`overall_reward`, `prompt_reward`, and `harmonic_reward` are all required when reward guidance "
+                    "is enabled."
+                )
+        if balance_reward_gradients:
+            reward_weights = [overall_reward_scale, prompt_reward_scale, harmonic_reward_scale]
+            if any(weight < 0 for weight in reward_weights):
+                raise ValueError("Reward weights must be non-negative when gradient balancing is enabled.")
+            if sum(reward_weights) <= 0:
+                raise ValueError(
+                    "At least one reward weight must be greater than 0 when gradient balancing is enabled."
+                )
+
+        # Save reward models, scales, and gradient-balancing settings.
         self.overall_reward = overall_reward
         self.prompt_reward = prompt_reward
         self.harmonic_reward = harmonic_reward
@@ -1070,6 +1180,10 @@ class StableDiffusionBrushNetPipeline(
         self.harmonic_reward_scale = harmonic_reward_scale
         self.reward_guidance_scale = reward_guidance_scale
         self.guide_per_steps = guide_per_steps
+        self.balance_reward_gradients = balance_reward_gradients
+        self.reward_gradient_eps = reward_gradient_eps
+        self.reward_gradient_scale_min = reward_gradient_scale_min
+        self.reward_gradient_scale_max = reward_gradient_scale_max
 
         if callback is not None:
             deprecate(
@@ -1327,7 +1441,7 @@ class StableDiffusionBrushNetPipeline(
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                # Apply DeGu (cond_fn) guidance
+                # Apply DeGu/TriRG reward guidance.
                 if self.reward_guidance_scale > 0 and (i + 1) % self.guide_per_steps == 0:
                     text_embeddings_guidance = prompt_embeds.chunk(2)[1] if self.do_classifier_free_guidance else prompt_embeds
                     conditioning_latents_guidance = conditioning_latents.chunk(2)[1] if self.do_classifier_free_guidance else conditioning_latents

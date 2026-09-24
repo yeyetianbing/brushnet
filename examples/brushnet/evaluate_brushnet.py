@@ -217,6 +217,14 @@ parser.add_argument('--guide_per_steps', type=int, default=5)
 parser.add_argument('--overall_reward_scale', type=float, default=1.0)
 parser.add_argument('--prompt_reward_scale', type=float, default=1.0)
 parser.add_argument('--harmonic_reward_scale', type=float, default=1.0)
+parser.add_argument(
+    '--balance_reward_gradients',
+    action='store_true',
+    help='Balance the per-reward latent-gradient RMS magnitudes before weighted fusion.',
+)
+parser.add_argument('--reward_gradient_eps', type=float, default=1e-6)
+parser.add_argument('--reward_gradient_scale_min', type=float, default=0.25)
+parser.add_argument('--reward_gradient_scale_max', type=float, default=4.0)
 parser.add_argument('--clip_model_path', type=str, default='openai/clip-vit-large-patch14')
 parser.add_argument('--imagereward_path', type=str, default='data/ckpt')
 parser.add_argument('--harmonic_config_path', type=str, default='examples/freeinpaint/metrics/configs.yaml')
@@ -229,6 +237,13 @@ args = parser.parse_args()
 
 if args.guide_per_steps <= 0:
     raise ValueError('`--guide_per_steps` must be greater than 0.')
+if args.reward_gradient_eps <= 0:
+    raise ValueError('`--reward_gradient_eps` must be greater than 0.')
+if args.reward_gradient_scale_min <= 0 or args.reward_gradient_scale_max < args.reward_gradient_scale_min:
+    raise ValueError(
+        'Reward-gradient scale bounds must satisfy '
+        '0 < --reward_gradient_scale_min <= --reward_gradient_scale_max.'
+    )
 
 os.makedirs(args.image_save_path, exist_ok=True)
 args_path = os.path.join(args.image_save_path, 'args.json')
@@ -254,10 +269,21 @@ print(
     'BrushNet architecture: '
     + ('adaptive feature fusion' if args.use_adaptive_fusion else 'original (adaptive fusion disabled)')
 )
+reward_guidance_name = 'TriRG' if args.balance_reward_gradients else 'DeGu'
 print(
-    'DeGu guidance: '
+    f'{reward_guidance_name} guidance: '
     + (f'enabled (scale={args.reward_guidance_scale}, every {args.guide_per_steps} steps)'
        if args.reward_guidance_scale > 0 else 'disabled')
+)
+print(
+    'Reward gradient balancing: '
+    + (
+        'enabled '
+        f'(eps={args.reward_gradient_eps}, scale range='
+        f'[{args.reward_gradient_scale_min}, {args.reward_gradient_scale_max}])'
+        if args.balance_reward_gradients
+        else 'disabled (original DeGu fusion)'
+    )
 )
 
 brushnet = BrushNetModel.from_pretrained(
@@ -284,7 +310,7 @@ if args.reward_guidance_scale == 0:
 else:
     pipe.to(device)
 
-# Initialize reward models if reward_guidance_scale > 0
+# Initialize reward models if reward guidance is enabled.
 overall_reward = None
 prompt_reward = None
 harmonic_reward = None
@@ -346,6 +372,10 @@ for key, item in mapping_file.items():
         harmonic_reward_scale=args.harmonic_reward_scale,
         reward_guidance_scale=args.reward_guidance_scale,
         guide_per_steps=args.guide_per_steps,
+        balance_reward_gradients=args.balance_reward_gradients,
+        reward_gradient_eps=args.reward_gradient_eps,
+        reward_gradient_scale_min=args.reward_gradient_scale_min,
+        reward_gradient_scale_max=args.reward_gradient_scale_max,
     ).images[0]
     
     if not os.path.exists(os.path.dirname(save_path)):
