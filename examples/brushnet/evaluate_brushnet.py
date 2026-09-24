@@ -6,6 +6,7 @@ import os
 import numpy as np
 from PIL import Image
 import argparse
+import gc
 import pandas as pd
 import torch
 from torchvision.transforms import Resize
@@ -191,7 +192,7 @@ parser.add_argument('--brushnet_ckpt_path',
                     default="data/ckpt/segmentation_mask_brushnet_ckpt")
 parser.add_argument('--base_model_path', 
                     type=str, 
-                    default="stable-diffusion-v1-5/stable-diffusion-v1-5")
+                    default="data/ckpt/realisticVisionV60B1_v51VAE")
 parser.add_argument('--image_save_path', 
                     type=str, 
                     default="runs/evaluation_result/BrushBench/brushnet_segmask/inside")
@@ -206,6 +207,11 @@ parser.add_argument('--mask_key',
                     default="inpainting_mask")
 parser.add_argument('--blended', action='store_true')
 parser.add_argument('--paintingnet_conditioning_scale', type=float,default=1.0)
+parser.add_argument(
+    '--use_adaptive_fusion',
+    action='store_true',
+    help='Enable adaptive feature fusion. Leave unset to run the original BrushNet architecture.',
+)
 parser.add_argument('--reward_guidance_scale', type=float, default=0.0)
 parser.add_argument('--guide_per_steps', type=int, default=5)
 parser.add_argument('--overall_reward_scale', type=float, default=1.0)
@@ -213,20 +219,60 @@ parser.add_argument('--prompt_reward_scale', type=float, default=1.0)
 parser.add_argument('--harmonic_reward_scale', type=float, default=1.0)
 parser.add_argument('--clip_model_path', type=str, default='openai/clip-vit-large-patch14')
 parser.add_argument('--imagereward_path', type=str, default='data/ckpt')
-parser.add_argument('--harmonic_config_path', type=str, default='examples/freeinpaint/metrics/config.yaml')
-parser.add_argument('--harmonic_ckpt_path', type=str, default='data/ckpt/harmonic_reward.pth')
+parser.add_argument('--harmonic_config_path', type=str, default='examples/freeinpaint/metrics/configs.yaml')
+parser.add_argument('--harmonic_ckpt_path', type=str, default='data/ckpt/prefpaintReward.pt')
+parser.add_argument('--num_inference_steps', type=int, default=50)
+parser.add_argument('--seed', type=int, default=1234)
+parser.add_argument('--overwrite', action='store_true')
 
 args = parser.parse_args()
+
+if args.guide_per_steps <= 0:
+    raise ValueError('`--guide_per_steps` must be greater than 0.')
+
+os.makedirs(args.image_save_path, exist_ok=True)
+args_path = os.path.join(args.image_save_path, 'args.json')
+run_args = vars(args).copy()
+run_args.pop('overwrite')
+if os.path.exists(args_path) and not args.overwrite:
+    with open(args_path, 'r') as f:
+        previous_args = json.load(f)
+    if previous_args != run_args:
+        raise ValueError(
+            f'Output directory already contains results produced with different arguments: {args.image_save_path}. '
+            'Choose a new `--image_save_path` or pass `--overwrite`.'
+        )
+with open(args_path, 'w') as f:
+    json.dump(run_args, f, indent=2)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 base_model_path = args.base_model_path
 brushnet_path = args.brushnet_ckpt_path
 
-brushnet = BrushNetModel.from_pretrained(brushnet_path, torch_dtype=torch.float16, use_timestep_modulation=False).to(device)
+print(
+    'BrushNet architecture: '
+    + ('adaptive feature fusion' if args.use_adaptive_fusion else 'original (adaptive fusion disabled)')
+)
+print(
+    'DeGu guidance: '
+    + (f'enabled (scale={args.reward_guidance_scale}, every {args.guide_per_steps} steps)'
+       if args.reward_guidance_scale > 0 else 'disabled')
+)
+
+brushnet = BrushNetModel.from_pretrained(
+    brushnet_path,
+    torch_dtype=torch.float16,
+    use_adaptive_fusion=args.use_adaptive_fusion,
+    use_timestep_modulation=False,
+).to(device)
 pipe = StableDiffusionBrushNetPipeline.from_pretrained(
     base_model_path, brushnet=brushnet, torch_dtype=torch.float16,low_cpu_mem_usage=False
 )
+
+for module in (pipe.vae, pipe.unet, pipe.brushnet, pipe.text_encoder):
+    module.requires_grad_(False)
+    module.eval()
 
 # speed up diffusion process with faster scheduler and memory optimization
 pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
@@ -243,11 +289,22 @@ overall_reward = None
 prompt_reward = None
 harmonic_reward = None
 if args.reward_guidance_scale > 0:
+    if not os.path.exists(args.harmonic_config_path):
+        raise FileNotFoundError(f'Harmonic reward config not found: {args.harmonic_config_path}')
+    if not os.path.exists(args.harmonic_ckpt_path):
+        raise FileNotFoundError(f'Harmonic reward checkpoint not found: {args.harmonic_ckpt_path}')
+
     overall_reward = ImageRewardScore(args.imagereward_path, device=device)
     prompt_reward = PromptRewardScore(args.clip_model_path, device=device)
     harmonic_reward = InpaintReward(args.harmonic_config_path, device=device)
-    if os.path.exists(args.harmonic_ckpt_path):
-        harmonic_reward = harmonic_reward.load_model(harmonic_reward, args.harmonic_ckpt_path)
+    harmonic_reward = harmonic_reward.load_model(harmonic_reward, args.harmonic_ckpt_path)
+
+    overall_reward.model.requires_grad_(False)
+    overall_reward.model.eval()
+    prompt_reward.model.requires_grad_(False)
+    prompt_reward.model.eval()
+    harmonic_reward.requires_grad_(False)
+    harmonic_reward.eval()
 
 with open(args.mapping_file,"r") as f:
     mapping_file=json.load(f)
@@ -265,12 +322,12 @@ for key, item in mapping_file.items():
     init_image = Image.fromarray(init_image).convert("RGB")
     mask_image = Image.fromarray(mask_image.repeat(3,-1)*255).convert("RGB")
 
-    generator = torch.Generator(device).manual_seed(1234)
+    generator = torch.Generator(device).manual_seed(args.seed)
 
     save_path= os.path.join(args.image_save_path,image_path) 
     masked_image_save_path=save_path.replace(".jpg","_masked.jpg")
 
-    if os.path.exists(save_path) and os.path.exists(masked_image_save_path):
+    if not args.overwrite and os.path.exists(save_path) and os.path.exists(masked_image_save_path):
         print(f"image {key} exitst! skip...")
         continue
 
@@ -278,7 +335,7 @@ for key, item in mapping_file.items():
         caption,
         init_image,
         mask_image,
-        num_inference_steps=50,
+        num_inference_steps=args.num_inference_steps,
         generator=generator,
         paintingnet_conditioning_scale=args.paintingnet_conditioning_scale,
         overall_reward=overall_reward,
@@ -310,6 +367,13 @@ for key, item in mapping_file.items():
 
     image.save(save_path)
     init_image.save(masked_image_save_path)
+
+# DeGu generation requires several large differentiable reward networks. Release them
+# before constructing the independent evaluation models to avoid unnecessary GPU memory use.
+del pipe, brushnet, overall_reward, prompt_reward, harmonic_reward
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 # evaluation
 evaluation_df = pd.DataFrame(columns=['Image ID','Image Reward', 'HPS V2.1', 'Aesthetic Score', 'PSNR', 'LPIPS', 'MSE', 'SSIM', 'CLIP Similarity'])

@@ -181,6 +181,7 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         global_pool_conditions: bool = False,
         addition_embed_type_num_heads: int = 64,
         # 自适应特征融合模块参数
+        use_adaptive_fusion: bool = True,
         fusion_activation: str = "relu",
         fusion_use_residual: bool = True,
         fusion_strength: float = 0.3,
@@ -455,62 +456,65 @@ class BrushNetModel(ModelMixin, ConfigMixin):
                 brushnet_block = zero_module(brushnet_block)
                 self.brushnet_up_blocks.append(brushnet_block)
 
-        # 自适应特征融合模块
-        # 为每个下采样块、中间块和上采样块创建独立的融合模块
-        self.adaptive_fusion_down = nn.ModuleList([])
-        self.adaptive_fusion_up = nn.ModuleList([])
+        mid_channels = block_out_channels[-1]
+        self.use_adaptive_fusion = use_adaptive_fusion
 
-        # 为下采样块创建融合模块
-        # 注意：down_block_res_samples 包含 conv_in 的输出 + 所有下采样块的输出
-        # 第一个输出是 conv_in，通道数为 block_out_channels[0]
-        self.adaptive_fusion_down.append(
-            AdaptiveFeatureFusion(
-                block_out_channels[0],
+        # 自适应特征融合模块。关闭时使用无参数的恒等映射，以便在同一代码中
+        # 精确复现原始 BrushNet，而不会让原始 checkpoint 经过随机初始化的融合层。
+        if use_adaptive_fusion:
+            self.adaptive_fusion_down = nn.ModuleList([])
+            self.adaptive_fusion_up = nn.ModuleList([])
+
+            # down_block_res_samples 包含 conv_in 的输出和各下采样块的输出。
+            self.adaptive_fusion_down.append(
+                AdaptiveFeatureFusion(
+                    block_out_channels[0],
+                    activation=fusion_activation,
+                    use_residual=fusion_use_residual,
+                    fusion_strength=fusion_strength,
+                )
+            )
+
+            for i, _ in enumerate(self.down_blocks):
+                out_channels = block_out_channels[i]
+                num_outputs = layers_per_block + (1 if i < len(block_out_channels) - 1 else 0)
+                for _ in range(num_outputs):
+                    self.adaptive_fusion_down.append(
+                        AdaptiveFeatureFusion(
+                            out_channels,
+                            activation=fusion_activation,
+                            use_residual=fusion_use_residual,
+                            fusion_strength=fusion_strength,
+                        )
+                    )
+
+            self.adaptive_fusion_mid = AdaptiveFeatureFusion(
+                mid_channels,
                 activation=fusion_activation,
                 use_residual=fusion_use_residual,
-                fusion_strength=fusion_strength
+                fusion_strength=fusion_strength,
             )
-        )
 
-        for i, down_block in enumerate(self.down_blocks):
-            # 获取该块的输出通道数
-            out_channels = block_out_channels[i]
-            # 每个下采样块有 layers_per_block 个 ResNet 输出 + 可能的下采样输出
-            num_outputs = layers_per_block + (1 if i < len(block_out_channels) - 1 else 0)
-            for _ in range(num_outputs):
-                self.adaptive_fusion_down.append(
-                    AdaptiveFeatureFusion(
-                        out_channels,
-                        activation=fusion_activation,
-                        use_residual=fusion_use_residual,
-                        fusion_strength=fusion_strength
+            for i, _ in enumerate(self.up_blocks):
+                out_channels = reversed_block_out_channels[i]
+                num_outputs = layers_per_block + 1 + (1 if i < len(block_out_channels) - 1 else 0)
+                for _ in range(num_outputs):
+                    self.adaptive_fusion_up.append(
+                        AdaptiveFeatureFusion(
+                            out_channels,
+                            activation=fusion_activation,
+                            use_residual=fusion_use_residual,
+                            fusion_strength=fusion_strength,
+                        )
                     )
-                )
-
-        # 为中间块创建融合模块
-        mid_channels = block_out_channels[-1]
-        self.adaptive_fusion_mid = AdaptiveFeatureFusion(
-            mid_channels,
-            activation=fusion_activation,
-            use_residual=fusion_use_residual,
-            fusion_strength=fusion_strength
-        )
-
-        # 为上采样块创建融合模块
-        for i, up_block in enumerate(self.up_blocks):
-            # 获取该块的输出通道数
-            out_channels = reversed_block_out_channels[i]
-            # 每个上采样块有 layers_per_block+1 个输出 + 可能的上采样输出
-            num_outputs = layers_per_block + 1 + (1 if i < len(block_out_channels) - 1 else 0)
-            for _ in range(num_outputs):
-                self.adaptive_fusion_up.append(
-                    AdaptiveFeatureFusion(
-                        out_channels,
-                        activation=fusion_activation,
-                        use_residual=fusion_use_residual,
-                        fusion_strength=fusion_strength
-                    )
-                )
+        else:
+            self.adaptive_fusion_down = nn.ModuleList(
+                [nn.Identity() for _ in self.brushnet_down_blocks]
+            )
+            self.adaptive_fusion_mid = nn.Identity()
+            self.adaptive_fusion_up = nn.ModuleList(
+                [nn.Identity() for _ in self.brushnet_up_blocks]
+            )
 
         # 时间步自适应调制模块
         # 为每个下采样块、中间块和上采样块创建独立的时间步调制模块
@@ -569,6 +573,7 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         conditioning_embedding_out_channels: Optional[Tuple[int, ...]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = True,
         conditioning_channels: int = 5,
+        use_adaptive_fusion: bool = True,
         fusion_activation: str = "relu",
         fusion_use_residual: bool = True,
         fusion_strength: float = 0.3,
@@ -625,6 +630,7 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
             brushnet_conditioning_channel_order=brushnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
+            use_adaptive_fusion=use_adaptive_fusion,
             fusion_activation=fusion_activation,
             fusion_use_residual=fusion_use_residual,
             fusion_strength=fusion_strength,
