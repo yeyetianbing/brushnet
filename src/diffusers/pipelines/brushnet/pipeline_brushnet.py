@@ -130,10 +130,17 @@ def _balance_reward_gradients(
     reward_gradients: List[torch.Tensor],
     reward_weights: List[float],
     eps: float = 1e-6,
-    scale_min: float = 0.25,
-    scale_max: float = 4.0,
+    scale_min: float = 0.9,
+    scale_max: float = 1.1,
+    balance_strength: float = 0.25,
 ) -> torch.Tensor:
-    """Balance heterogeneous reward gradients by their per-sample RMS magnitude."""
+    """Conservatively balance reward gradients while preserving the DeGu update magnitude.
+
+    The RMS-balanced gradient is first matched to the per-sample RMS of the original
+    weighted DeGu gradient. ``balance_strength`` then interpolates between the two,
+    making zero exactly recover the original weighted fusion and one use the fully
+    balanced direction.
+    """
     if len(reward_gradients) == 0:
         raise ValueError("`reward_gradients` must contain at least one tensor.")
     if len(reward_gradients) != len(reward_weights):
@@ -142,6 +149,8 @@ def _balance_reward_gradients(
         raise ValueError("`eps` must be greater than 0.")
     if scale_min <= 0 or scale_max < scale_min:
         raise ValueError("Reward-gradient scale bounds must satisfy 0 < scale_min <= scale_max.")
+    if not 0 <= balance_strength <= 1:
+        raise ValueError("`balance_strength` must be between 0 and 1, inclusive.")
     if any(weight < 0 for weight in reward_weights):
         raise ValueError("Reward weights must be non-negative when gradient balancing is enabled.")
 
@@ -153,6 +162,15 @@ def _balance_reward_gradients(
     if any(gradient.shape != reference_shape for gradient in reward_gradients):
         raise ValueError("All reward gradients must have the same shape.")
 
+    original_gradient = torch.zeros_like(reward_gradients[0])
+    for gradient, weight in zip(reward_gradients, reward_weights):
+        original_gradient = original_gradient + weight * gradient
+
+    # This is the exact DeGu fusion and also avoids unnecessary RMS computation for
+    # the equivalence/control setting.
+    if balance_strength == 0:
+        return original_gradient
+
     reduce_dims = tuple(range(1, reward_gradients[0].ndim))
     gradient_rms = [
         gradient.detach().float().square().mean(dim=reduce_dims, keepdim=True).sqrt().clamp_min(eps)
@@ -160,12 +178,24 @@ def _balance_reward_gradients(
     ]
     reference_rms = torch.stack(gradient_rms, dim=0).mean(dim=0)
 
-    combined_gradient = torch.zeros_like(reward_gradients[0])
+    balanced_gradient = torch.zeros_like(reward_gradients[0])
     for gradient, weight, rms in zip(reward_gradients, reward_weights, gradient_rms):
         balance_scale = (reference_rms / rms).clamp(min=scale_min, max=scale_max)
-        combined_gradient = combined_gradient + weight * gradient * balance_scale.to(gradient.dtype)
+        balanced_gradient = balanced_gradient + weight * gradient * balance_scale.to(gradient.dtype)
 
-    return combined_gradient
+    # RMS balancing changes both direction and total update magnitude. Match the
+    # latter back to DeGu so TriRG only controls the relative reward contributions.
+    original_rms = original_gradient.detach().float().square().mean(dim=reduce_dims, keepdim=True).sqrt()
+    balanced_rms = balanced_gradient.detach().float().square().mean(dim=reduce_dims, keepdim=True).sqrt()
+    norm_scale = original_rms / balanced_rms.clamp_min(eps)
+    norm_matched_gradient = balanced_gradient * norm_scale.to(balanced_gradient.dtype)
+    balanced_gradient = torch.where(
+        balanced_rms > eps,
+        norm_matched_gradient,
+        original_gradient,
+    )
+
+    return torch.lerp(original_gradient, balanced_gradient, balance_strength)
 
 
 class StableDiffusionBrushNetPipeline(
@@ -904,6 +934,7 @@ class StableDiffusionBrushNetPipeline(
                     eps=self.reward_gradient_eps,
                     scale_min=self.reward_gradient_scale_min,
                     scale_max=self.reward_gradient_scale_max,
+                    balance_strength=self.reward_gradient_balance_strength,
                 )
                 grads = grads * reward_guidance_scale
             else:
@@ -1013,8 +1044,9 @@ class StableDiffusionBrushNetPipeline(
         guide_per_steps: int = 5,
         balance_reward_gradients: bool = False,
         reward_gradient_eps: float = 1e-6,
-        reward_gradient_scale_min: float = 0.25,
-        reward_gradient_scale_max: float = 4.0,
+        reward_gradient_scale_min: float = 0.9,
+        reward_gradient_scale_max: float = 1.1,
+        reward_gradient_balance_strength: float = 0.25,
         **kwargs,
     ):
         r"""
@@ -1126,10 +1158,13 @@ class StableDiffusionBrushNetPipeline(
                 before applying the configured reward weights. Keep disabled to reproduce the original DeGu behavior.
             reward_gradient_eps (`float`, *optional*, defaults to `1e-6`):
                 Numerical stability constant used by reward-gradient RMS balancing.
-            reward_gradient_scale_min (`float`, *optional*, defaults to `0.25`):
+            reward_gradient_scale_min (`float`, *optional*, defaults to `0.9`):
                 Minimum multiplicative rescaling applied to an individual reward gradient.
-            reward_gradient_scale_max (`float`, *optional*, defaults to `4.0`):
+            reward_gradient_scale_max (`float`, *optional*, defaults to `1.1`):
                 Maximum multiplicative rescaling applied to an individual reward gradient.
+            reward_gradient_balance_strength (`float`, *optional*, defaults to `0.25`):
+                Interpolation strength between the original DeGu gradient and the norm-matched balanced gradient.
+                Use `0` to recover DeGu fusion and `1` for full gradient balancing.
 
         Examples:
 
@@ -1155,6 +1190,8 @@ class StableDiffusionBrushNetPipeline(
                 "Reward-gradient scale bounds must satisfy "
                 "0 < reward_gradient_scale_min <= reward_gradient_scale_max."
             )
+        if not 0 <= reward_gradient_balance_strength <= 1:
+            raise ValueError("`reward_gradient_balance_strength` must be between 0 and 1, inclusive.")
         if reward_guidance_scale > 0:
             reward_models = [overall_reward, prompt_reward, harmonic_reward]
             if any(reward_model is None for reward_model in reward_models):
@@ -1184,6 +1221,7 @@ class StableDiffusionBrushNetPipeline(
         self.reward_gradient_eps = reward_gradient_eps
         self.reward_gradient_scale_min = reward_gradient_scale_min
         self.reward_gradient_scale_max = reward_gradient_scale_max
+        self.reward_gradient_balance_strength = reward_gradient_balance_strength
 
         if callback is not None:
             deprecate(

@@ -220,11 +220,17 @@ parser.add_argument('--harmonic_reward_scale', type=float, default=1.0)
 parser.add_argument(
     '--balance_reward_gradients',
     action='store_true',
-    help='Balance the per-reward latent-gradient RMS magnitudes before weighted fusion.',
+    help='Apply conservative TriRG reward-gradient balancing with DeGu norm preservation.',
 )
 parser.add_argument('--reward_gradient_eps', type=float, default=1e-6)
-parser.add_argument('--reward_gradient_scale_min', type=float, default=0.25)
-parser.add_argument('--reward_gradient_scale_max', type=float, default=4.0)
+parser.add_argument('--reward_gradient_scale_min', type=float, default=0.9)
+parser.add_argument('--reward_gradient_scale_max', type=float, default=1.1)
+parser.add_argument(
+    '--reward_gradient_balance_strength',
+    type=float,
+    default=0.25,
+    help='TriRG interpolation strength in [0, 1]; 0 recovers DeGu and 1 applies full balancing.',
+)
 parser.add_argument('--clip_model_path', type=str, default='openai/clip-vit-large-patch14')
 parser.add_argument('--imagereward_path', type=str, default='data/ckpt')
 parser.add_argument('--harmonic_config_path', type=str, default='examples/freeinpaint/metrics/configs.yaml')
@@ -244,6 +250,8 @@ if args.reward_gradient_scale_min <= 0 or args.reward_gradient_scale_max < args.
         'Reward-gradient scale bounds must satisfy '
         '0 < --reward_gradient_scale_min <= --reward_gradient_scale_max.'
     )
+if not 0 <= args.reward_gradient_balance_strength <= 1:
+    raise ValueError('`--reward_gradient_balance_strength` must be between 0 and 1, inclusive.')
 
 os.makedirs(args.image_save_path, exist_ok=True)
 args_path = os.path.join(args.image_save_path, 'args.json')
@@ -280,7 +288,8 @@ print(
     + (
         'enabled '
         f'(eps={args.reward_gradient_eps}, scale range='
-        f'[{args.reward_gradient_scale_min}, {args.reward_gradient_scale_max}])'
+        f'[{args.reward_gradient_scale_min}, {args.reward_gradient_scale_max}], '
+        f'strength={args.reward_gradient_balance_strength}, DeGu norm preserved)'
         if args.balance_reward_gradients
         else 'disabled (original DeGu fusion)'
     )
@@ -376,6 +385,7 @@ for key, item in mapping_file.items():
         reward_gradient_eps=args.reward_gradient_eps,
         reward_gradient_scale_min=args.reward_gradient_scale_min,
         reward_gradient_scale_max=args.reward_gradient_scale_max,
+        reward_gradient_balance_strength=args.reward_gradient_balance_strength,
     ).images[0]
     
     if not os.path.exists(os.path.dirname(save_path)):
