@@ -11,6 +11,10 @@ import open_clip
 import hpsv2
 import ImageReward as RM
 import math
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from freeinpaint.metrics.prefpaint import InpaintReward
 
 def rle2mask(mask_rle, shape):
     starts, lengths = [np.asarray(x, dtype=int) for x in (mask_rle[0:][::2], mask_rle[1:][::2])]
@@ -23,7 +27,13 @@ def rle2mask(mask_rle, shape):
 
 
 class MetricsCalculator:
-    def __init__(self, device, ckpt_path="data/ckpt") -> None:
+    def __init__(
+        self,
+        device,
+        ckpt_path="data/ckpt",
+        inpaint_reward_config_path="examples/freeinpaint/metrics/configs.yaml",
+        inpaint_reward_model_path="data/ckpt/prefpaintReward.pt",
+    ) -> None:
         self.device = device
         print("Initializing metrics calculators...")
 
@@ -51,6 +61,28 @@ class MetricsCalculator:
         print("Loading ImageReward model...")
         self.imagereward_model = RM.load("ImageReward-v1.0")
 
+        # inpaint reward
+        print("Loading InpaintReward model...")
+        if not os.path.exists(inpaint_reward_config_path):
+            raise FileNotFoundError(
+                f"InpaintReward config not found at {inpaint_reward_config_path}"
+            )
+        if not os.path.exists(inpaint_reward_model_path):
+            raise FileNotFoundError(
+                f"InpaintReward checkpoint not found at {inpaint_reward_model_path}"
+            )
+        self.inpaint_reward_model = InpaintReward(
+            inpaint_reward_config_path,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.inpaint_reward_model = self.inpaint_reward_model.load_model(
+            self.inpaint_reward_model,
+            inpaint_reward_model_path,
+        )
+        self.inpaint_reward_model.requires_grad_(False)
+        self.inpaint_reward_model.eval()
+
         print("All models loaded successfully!")
 
     def calculate_image_reward(self, image, prompt):
@@ -74,6 +106,31 @@ class MetricsCalculator:
         img_tensor = torch.tensor(img).permute(2, 0, 1).to(self.device)
         score = self.clip_metric_calculator(img_tensor, txt)
         score = score.cpu().item()
+        return score
+
+    def calculate_local_clip_similarity(self, img, txt, inpaint_mask):
+        image = np.array(img)
+        mask = np.asarray(inpaint_mask)
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+
+        rows, cols = np.where(mask > 0)
+        if rows.size > 0 and cols.size > 0:
+            y_min, y_max = rows.min(), rows.max() + 1
+            x_min, x_max = cols.min(), cols.max() + 1
+            image = image[y_min:y_max, x_min:x_max]
+
+        image_tensor = torch.tensor(image).permute(2, 0, 1).to(self.device)
+        score = self.clip_metric_calculator(image_tensor, txt)
+        return score.cpu().item()
+
+    def calculate_inpaint_reward(self, img, inpaint_mask):
+        mask = np.asarray(inpaint_mask)
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+        with torch.no_grad():
+            score, _ = self.inpaint_reward_model.score(img, mask_image)
         return score
 
     def calculate_psnr(self, img_pred, img_gt, mask=None):
@@ -158,6 +215,14 @@ if __name__ == "__main__":
                         type=str,
                         default="data/ckpt",
                         help='Path to model checkpoints')
+    parser.add_argument('--inpaint_reward_config_path',
+                        type=str,
+                        default="examples/freeinpaint/metrics/configs.yaml",
+                        help='Path to the InpaintReward configuration')
+    parser.add_argument('--inpaint_reward_model_path',
+                        type=str,
+                        default="data/ckpt/prefpaintReward.pt",
+                        help='Path to the InpaintReward checkpoint')
 
     args = parser.parse_args()
 
@@ -172,10 +237,26 @@ if __name__ == "__main__":
     print(f"Found {len(mapping_file)} images to evaluate")
 
     # Initialize metrics calculator
-    metrics_calculator = MetricsCalculator(device, ckpt_path=args.ckpt_path)
+    metrics_calculator = MetricsCalculator(
+        device,
+        ckpt_path=args.ckpt_path,
+        inpaint_reward_config_path=args.inpaint_reward_config_path,
+        inpaint_reward_model_path=args.inpaint_reward_model_path,
+    )
 
     # Create evaluation dataframe
-    evaluation_df = pd.DataFrame(columns=['Image ID', 'Image Reward', 'HPS V2.1', 'Aesthetic Score', 'PSNR', 'LPIPS', 'MSE', 'CLIP Similarity'])
+    evaluation_df = pd.DataFrame(columns=[
+        'Image ID',
+        'Image Reward',
+        'HPS V2.1',
+        'Aesthetic Score',
+        'PSNR',
+        'LPIPS',
+        'MSE',
+        'CLIP Similarity',
+        'Local CLIP',
+        'InpaintReward',
+    ])
 
     # Evaluate each image
     for idx, (key, item) in enumerate(mapping_file.items()):
@@ -199,8 +280,8 @@ if __name__ == "__main__":
         evaluation_result = [key]
 
         # Prepare mask
-        mask = rle2mask(mask, (512, 512))
-        mask = 1 - mask[:, :, np.newaxis]
+        inpaint_mask = rle2mask(mask, (512, 512))[:, :, np.newaxis]
+        known_region_mask = 1 - inpaint_mask
 
         # Calculate each metric
         for metric in evaluation_df.columns.values.tolist()[1:]:
@@ -217,16 +298,32 @@ if __name__ == "__main__":
                     metric_result = metrics_calculator.calculate_aesthetic_score(tgt_image)
 
                 elif metric == 'PSNR':
-                    metric_result = metrics_calculator.calculate_psnr(src_image, tgt_image, mask)
+                    metric_result = metrics_calculator.calculate_psnr(
+                        src_image, tgt_image, known_region_mask
+                    )
 
                 elif metric == 'LPIPS':
-                    metric_result = metrics_calculator.calculate_lpips(src_image, tgt_image, mask)
+                    metric_result = metrics_calculator.calculate_lpips(
+                        src_image, tgt_image, known_region_mask
+                    )
 
                 elif metric == 'MSE':
-                    metric_result = metrics_calculator.calculate_mse(src_image, tgt_image, mask)
+                    metric_result = metrics_calculator.calculate_mse(
+                        src_image, tgt_image, known_region_mask
+                    )
 
                 elif metric == 'CLIP Similarity':
                     metric_result = metrics_calculator.calculate_clip_similarity(tgt_image, prompt)
+
+                elif metric == 'Local CLIP':
+                    metric_result = metrics_calculator.calculate_local_clip_similarity(
+                        tgt_image, prompt, inpaint_mask
+                    )
+
+                elif metric == 'InpaintReward':
+                    metric_result = metrics_calculator.calculate_inpaint_reward(
+                        tgt_image, inpaint_mask
+                    )
 
                 print(f"{metric_result:.4f}")
                 evaluation_result.append(metric_result)
