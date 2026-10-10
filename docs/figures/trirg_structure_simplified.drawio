@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="Electron" agent="Codex" version="31.4.5" type="device" compressed="false">
+  <diagram id="trirg-simplified" name="TriRG 简化结构图">
+    <mxGraphModel dx="1800" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="900" math="0" shadow="0" background="#FFFFFF">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="TriRG 三元奖励引导（简化结构）" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Noto Sans CJK SC;fontSize=30;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="450" y="20" width="900" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="三类奖励独立求梯度，经幅值均衡后联合引导扩散采样" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontFamily=Noto Sans CJK SC;fontSize=16;fontColor=#64748B;" vertex="1" parent="1">
+          <mxGeometry x="500" y="65" width="800" height="30" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="inputs" value="&lt;b&gt;采样条件&lt;/b&gt;&lt;br&gt;&lt;br&gt;潜变量 z&lt;sub&gt;t&lt;/sub&gt;、时间步 t&lt;br&gt;文本 c、修复条件 z&lt;sub&gt;m&lt;/sub&gt; 与 m̃" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#EFF6FF;strokeColor=#2563EB;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#1E3A8A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="230" width="220" height="150" as="geometry"/>
+        </mxCell>
+        <mxCell id="denoiser" value="&lt;b&gt;条件扩散去噪器&lt;/b&gt;&lt;br&gt;&lt;br&gt;ε&lt;sub&gt;θ&lt;/sub&gt; = ε&lt;sub&gt;θ&lt;/sub&gt;(z&lt;sub&gt;t&lt;/sub&gt;, t, c, z&lt;sub&gt;m&lt;/sub&gt;, m̃)&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;ARAF-UNet / 任意修复去噪器&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#1E3A8A;" vertex="1" parent="1">
+          <mxGeometry x="320" y="220" width="280" height="170" as="geometry"/>
+        </mxCell>
+        <mxCell id="estimate" value="&lt;b&gt;可微图像估计 x&lt;sub&gt;t&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;&lt;br&gt;调度器反演 + VAE 解码" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#F8FAFC;strokeColor=#475569;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="660" y="230" width="220" height="150" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="reward-group" value="&lt;b&gt;三元可微奖励&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingTop=12;spacingLeft=16;container=1;collapsible=0;arcSize=14;fillColor=#FFFFFF;strokeColor=#64748B;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=18;fontColor=#334155;" vertex="1" parent="1">
+          <mxGeometry x="940" y="120" width="300" height="390" as="geometry"/>
+        </mxCell>
+        <mxCell id="reward-img" value="&lt;b&gt;全局图文偏好 R&lt;sub&gt;img&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;ImageReward(x&lt;sub&gt;t&lt;/sub&gt;, c)" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#DBEAFE;strokeColor=#3B82F6;strokeWidth=1.7;fontFamily=Noto Sans CJK SC;fontSize=16;fontColor=#1E3A8A;" vertex="1" parent="1">
+          <mxGeometry x="970" y="180" width="240" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="reward-loc" value="&lt;b&gt;局部语义对齐 R&lt;sub&gt;loc&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;Masked CLIP Distance" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#DCFCE7;strokeColor=#16A34A;strokeWidth=1.7;fontFamily=Noto Sans CJK SC;fontSize=16;fontColor=#14532D;" vertex="1" parent="1">
+          <mxGeometry x="970" y="290" width="240" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="reward-inp" value="&lt;b&gt;修复视觉合理性 R&lt;sub&gt;inp&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;InpaintReward(x&lt;sub&gt;t&lt;/sub&gt;, m)" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#FFEDD5;strokeColor=#EA580C;strokeWidth=1.7;fontFamily=Noto Sans CJK SC;fontSize=16;fontColor=#7C2D12;" vertex="1" parent="1">
+          <mxGeometry x="970" y="400" width="240" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="balance" value="&lt;b&gt;分奖励梯度均衡&lt;/b&gt;&lt;br&gt;&lt;br&gt;k ∈ {img, loc, inp}&lt;br&gt;g&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;(k)&lt;/sup&gt; = ∇&lt;sub&gt;zₜ&lt;/sub&gt;R&lt;sub&gt;k&lt;/sub&gt;&lt;br&gt;&lt;br&gt;g̃&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;(k)&lt;/sup&gt; = clip(n̄&lt;sub&gt;t&lt;/sub&gt;/n&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;(k)&lt;/sup&gt;) · g&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;(k)&lt;/sup&gt;&lt;br&gt;&lt;font color=&quot;#64748B&quot;&gt;RMS 幅值均衡与截断&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#F3E8FF;strokeColor=#8B5CF6;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#5B21B6;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="150" width="390" height="330" as="geometry"/>
+        </mxCell>
+        <mxCell id="fusion" value="&lt;b&gt;加权联合梯度&lt;/b&gt;&lt;br&gt;g&lt;sub&gt;t&lt;/sub&gt; = λ&lt;sub&gt;g&lt;/sub&gt; Σ&lt;sub&gt;k&lt;/sub&gt; λ&lt;sub&gt;k&lt;/sub&gt; g̃&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;(k)&lt;/sup&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#DDD6FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=18;fontColor=#4C1D95;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="540" width="390" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="correction" value="&lt;b&gt;修正噪声预测&lt;/b&gt;&lt;br&gt;&lt;br&gt;ε̂&lt;sub&gt;t&lt;/sub&gt; = ε&lt;sub&gt;θ&lt;/sub&gt; − √ᾱ&lt;sub&gt;t&lt;/sub&gt; · g&lt;sub&gt;t&lt;/sub&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=18;fontColor=#4C1D95;" vertex="1" parent="1">
+          <mxGeometry x="980" y="690" width="300" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="scheduler" value="&lt;b&gt;调度器更新&lt;/b&gt;&lt;br&gt;&lt;br&gt;z&lt;sub&gt;t−1&lt;/sub&gt; = Step(z&lt;sub&gt;t&lt;/sub&gt;, ε̂&lt;sub&gt;t&lt;/sub&gt;, t)" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#F8FAFC;strokeColor=#475569;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="630" y="690" width="280" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="next" value="&lt;b&gt;下一步潜变量&lt;/b&gt;&lt;br&gt;z&lt;sub&gt;t−1&lt;/sub&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#DBEAFE;strokeColor=#2563EB;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=18;fontColor=#1E3A8A;" vertex="1" parent="1">
+          <mxGeometry x="360" y="700" width="200" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="result" value="&lt;b&gt;最终修复结果&lt;/b&gt;&lt;br&gt;t = 1 时解码" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;fillColor=#EFF6FF;strokeColor=#2563EB;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#1E3A8A;" vertex="1" parent="1">
+          <mxGeometry x="50" y="700" width="230" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="interval-note" value="每隔 K 个去噪步执行 · 无需额外训练" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#FFF7ED;strokeColor=#F59E0B;strokeWidth=1.5;fontFamily=Noto Sans CJK SC;fontSize=14;fontColor=#92400E;" vertex="1" parent="1">
+          <mxGeometry x="1360" y="700" width="310" height="55" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e-input-denoiser" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2.2;" edge="1" parent="1" source="inputs" target="denoiser"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-denoiser-estimate" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#475569;strokeWidth=2.2;" edge="1" parent="1" source="denoiser" target="estimate"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-estimate-img" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#3B82F6;strokeWidth=2;exitX=1;exitY=0.35;entryX=0;entryY=0.5;" edge="1" parent="1" source="estimate" target="reward-img"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="910" y="282"/><mxPoint x="910" y="220"/></Array></mxGeometry></mxCell>
+        <mxCell id="e-estimate-loc" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#16A34A;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="estimate" target="reward-loc"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="920" y="305"/><mxPoint x="920" y="330"/></Array></mxGeometry></mxCell>
+        <mxCell id="e-estimate-inp" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#EA580C;strokeWidth=2;exitX=1;exitY=0.65;entryX=0;entryY=0.5;" edge="1" parent="1" source="estimate" target="reward-inp"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="930" y="328"/><mxPoint x="930" y="440"/></Array></mxGeometry></mxCell>
+        <mxCell id="e-img-balance" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#3B82F6;strokeWidth=2;entryX=0;entryY=0.22;" edge="1" parent="1" source="reward-img" target="balance"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-loc-balance" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#16A34A;strokeWidth=2;entryX=0;entryY=0.5;" edge="1" parent="1" source="reward-loc" target="balance"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-inp-balance" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#EA580C;strokeWidth=2;entryX=0;entryY=0.78;" edge="1" parent="1" source="reward-inp" target="balance"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-balance-fusion" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#7C3AED;strokeWidth=2.5;" edge="1" parent="1" source="balance" target="fusion"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-fusion-correction" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#7C3AED;strokeWidth=2.5;exitX=0.5;exitY=1;entryX=0.8;entryY=0;" edge="1" parent="1" source="fusion" target="correction"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="1515" y="660"/><mxPoint x="1220" y="660"/></Array></mxGeometry></mxCell>
+        <mxCell id="e-denoiser-correction" value="εθ" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#475569;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.2;entryY=0;fontFamily=Noto Sans CJK SC;fontSize=13;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="denoiser" target="correction"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="460" y="650"/><mxPoint x="1040" y="650"/></Array></mxGeometry></mxCell>
+        <mxCell id="e-correction-scheduler" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#7C3AED;strokeWidth=2.5;" edge="1" parent="1" source="correction" target="scheduler"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-scheduler-next" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#475569;strokeWidth=2.5;" edge="1" parent="1" source="scheduler" target="next"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-next-result" value="t = 1" style="edgeStyle=none;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;fontFamily=Noto Sans CJK SC;fontSize=12;fontColor=#1D4ED8;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="next" target="result"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e-next-loop" value="t &gt; 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;dashed=1;dashPattern=7 4;fontFamily=Noto Sans CJK SC;fontSize=12;fontColor=#1D4ED8;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=0;entryX=0;entryY=0.5;" edge="1" parent="1" source="next" target="inputs"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="460" y="620"/><mxPoint x="20" y="620"/><mxPoint x="20" y="305"/></Array></mxGeometry></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
